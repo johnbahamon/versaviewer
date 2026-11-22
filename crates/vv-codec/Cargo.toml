@@ -1,0 +1,10 @@
+[package]
+name = "vv-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+openh264 = "0.9.10"

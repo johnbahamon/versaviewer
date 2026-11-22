@@ -1,0 +1,22 @@
+[package]
+name = "vv-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+bytes = "1.12.2"
+getrandom = "0.4.3"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1.44"
+vv-capture = { version = "0.1.0", path = "../vv-capture" }
+vv-codec = { version = "0.1.0", path = "../vv-codec" }
+vv-input = { version = "0.1.0", path = "../vv-input" }
+vv-protocol = { version = "0.1.0", path = "../vv-protocol" }
+vv-transport = { version = "0.1.0", path = "../vv-transport" }
+
+[dev-dependencies]
+anyhow = "1.0.104"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time"] }

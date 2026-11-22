@@ -1,0 +1,452 @@
+//! Agent (controlled side) session engine.
+//!
+//! Security model (Phase 0):
+//! * The agent generates its own device ID and a one-time password (OTP)
+//!   from the OS CSPRNG. The signaling server relays but never stores it.
+//! * Password checks are constant-time and rate limited with exponential
+//!   lockout (brute-force protection).
+//! * [`ConsentPolicy::Prompt`] (default) asks the local user to accept every
+//!   session; the OTP rotates after each session.
+//! * [`ConsentPolicy::Unattended`] skips the prompt but requires a
+//!   fixed password configured by the machine's owner.
+//! * Only one session at a time. While it is active the app is told via
+//!   [`AgentEvent::SessionStarted`] so it can show a visible indicator.
+//! * Media and input are end-to-end encrypted by WebRTC (DTLS-SRTP/SCTP).
+
+use crate::credentials::{self, AttemptLimiter};
+use anyhow::{Context, Result, anyhow};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, watch};
+use vv_capture::ScreenCapturer;
+use vv_codec::{EncodedFrame, EncoderSettings, H264Encoder};
+use vv_protocol::PROTOCOL_VERSION;
+use vv_protocol::control::ControlMessage;
+use vv_protocol::signal::{ClientMessage, ServerMessage};
+use vv_transport::{
+    ConnectionState, Peer, PeerEvent, Role, SignalingClient, SignalingSender, TransportConfig,
+};
+
+#[derive(Debug, Clone)]
+pub enum ConsentPolicy {
+    /// Ask the local user for every incoming session (assisted support).
+    Prompt,
+    /// Accept sessions that present this fixed password (unattended access).
+    Unattended { password: String },
+}
+
+/// Information shown to the local user when asking for consent.
+#[derive(Debug, Clone)]
+pub struct ConsentRequest {
+    pub session_id: String,
+}
+
+/// Asks the local user whether to accept a session. Blocking; called on a
+/// dedicated thread.
+pub trait ConsentPrompt: Send + Sync + 'static {
+    fn ask(&self, request: &ConsentRequest) -> bool;
+}
+
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    /// Registered with the server; show these credentials to the user.
+    Ready { device_id: String, password: String },
+    /// A remote session is now active (show a visible indicator!).
+    SessionStarted { session_id: String },
+    SessionEnded { session_id: String, reason: String },
+    /// The one-time password changed (after each session in Prompt mode).
+    PasswordChanged { password: String },
+    Rejected { reason: String },
+}
+
+pub struct AgentConfig {
+    pub signaling_url: String,
+    pub device_id: Option<String>,
+    pub transport: TransportConfig,
+    pub encoder: EncoderSettings,
+    pub display: Option<usize>,
+    pub consent: ConsentPolicy,
+}
+
+type EventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
+
+enum Phase {
+    Idle,
+    /// Waiting for the local user's decision.
+    AwaitingConsent { session_id: String },
+    /// Accepted; waiting for the viewer's SDP offer.
+    AwaitingOffer { session_id: String },
+    Active { session_id: String, stop: watch::Sender<bool> },
+}
+
+impl Phase {
+    fn session_id(&self) -> Option<&str> {
+        match self {
+            Phase::Idle => None,
+            Phase::AwaitingConsent { session_id }
+            | Phase::AwaitingOffer { session_id }
+            | Phase::Active { session_id, .. } => Some(session_id),
+        }
+    }
+}
+
+/// Runs the agent until the signaling connection closes.
+pub async fn run_agent(
+    config: AgentConfig,
+    prompt: Arc<dyn ConsentPrompt>,
+    on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+) -> Result<()> {
+    let on_event: EventSink = Arc::new(on_event);
+    if let ConsentPolicy::Unattended { password } = &config.consent {
+        anyhow::ensure!(
+            password.chars().count() >= 8,
+            "unattended password must have at least 8 characters"
+        );
+    }
+    let device_id = match &config.device_id {
+        Some(id) => id.clone(),
+        None => credentials::generate_device_id()?,
+    };
+    let mut password = match &config.consent {
+        ConsentPolicy::Prompt => credentials::generate_password()?,
+        ConsentPolicy::Unattended { password } => password.clone(),
+    };
+
+    let mut signaling = SignalingClient::connect(&config.signaling_url).await?;
+    signaling.send(ClientMessage::Register {
+        device_id: device_id.clone(),
+        protocol: PROTOCOL_VERSION,
+    })?;
+
+    let (consent_tx, mut consent_rx) = mpsc::unbounded_channel::<(String, bool)>();
+    let (ended_tx, mut ended_rx) = mpsc::unbounded_channel::<(String, String)>();
+    let mut limiter = AttemptLimiter::default();
+    let mut phase = Phase::Idle;
+    let config = Arc::new(config);
+
+    loop {
+        tokio::select! {
+            msg = signaling.recv() => {
+                let Some(msg) = msg else { break };
+                match msg {
+                    ServerMessage::Registered { device_id } => {
+                        on_event(AgentEvent::Ready { device_id, password: password.clone() });
+                    }
+                    ServerMessage::ConnectRequest { session_id, password: offered } => {
+                        let now = Instant::now();
+                        let reject = |reason: &str| ClientMessage::Reject {
+                            session_id: session_id.clone(),
+                            reason: reason.to_owned(),
+                        };
+                        if !matches!(phase, Phase::Idle) {
+                            signaling.send(reject("busy"))?;
+                        } else if let Some(wait) = limiter.locked(now) {
+                            signaling.send(reject(&format!(
+                                "too many failed attempts, retry in {}s", wait.as_secs() + 1
+                            )))?;
+                        } else if !credentials::constant_time_eq(&offered, &password) {
+                            limiter.record_failure(now);
+                            tracing::warn!(%session_id, "connection attempt with wrong password");
+                            on_event(AgentEvent::Rejected { reason: "wrong password".into() });
+                            signaling.send(reject("invalid credentials"))?;
+                        } else {
+                            limiter.record_success();
+                            match &config.consent {
+                                ConsentPolicy::Unattended { .. } => {
+                                    signaling.send(ClientMessage::Accept { session_id: session_id.clone() })?;
+                                    phase = Phase::AwaitingOffer { session_id };
+                                }
+                                ConsentPolicy::Prompt => {
+                                    let prompt = prompt.clone();
+                                    let tx = consent_tx.clone();
+                                    let request = ConsentRequest { session_id: session_id.clone() };
+                                    tokio::task::spawn_blocking(move || {
+                                        let accepted = prompt.ask(&request);
+                                        let _ = tx.send((request.session_id, accepted));
+                                    });
+                                    phase = Phase::AwaitingConsent { session_id };
+                                }
+                            }
+                        }
+                    }
+                    ServerMessage::Sdp { session_id, sdp } => {
+                        let Phase::AwaitingOffer { session_id: expected } = &phase else {
+                            tracing::warn!("unexpected SDP ignored");
+                            continue;
+                        };
+                        if *expected != session_id {
+                            tracing::warn!("SDP for unknown session ignored");
+                            continue;
+                        }
+                        let (stop_tx, stop_rx) = watch::channel(false);
+                        let sender = signaling.sender();
+                        let ended = ended_tx.clone();
+                        let cfg = config.clone();
+                        let id = session_id.clone();
+                        tokio::spawn(async move {
+                            let reason = match run_session(&cfg, &id, &sdp, &sender, stop_rx).await {
+                                Ok(reason) => reason,
+                                Err(e) => format!("error: {e:#}"),
+                            };
+                            let _ = sender.send(ClientMessage::Hangup { session_id: id.clone() });
+                            let _ = ended.send((id, reason));
+                        });
+                        on_event(AgentEvent::SessionStarted { session_id: session_id.clone() });
+                        phase = Phase::Active { session_id, stop: stop_tx };
+                    }
+                    ServerMessage::Hangup { session_id } => {
+                        if phase.session_id() == Some(session_id.as_str()) {
+                            match &phase {
+                                Phase::Active { stop, .. } => { let _ = stop.send(true); }
+                                _ => phase = Phase::Idle,
+                            }
+                        }
+                    }
+                    ServerMessage::Error { message } => tracing::warn!("server error: {message}"),
+                    other => tracing::debug!("ignored server message: {other:?}"),
+                }
+            }
+            Some((session_id, accepted)) = consent_rx.recv() => {
+                if !matches!(&phase, Phase::AwaitingConsent { session_id: s } if *s == session_id) {
+                    continue; // viewer gave up meanwhile
+                }
+                if accepted {
+                    signaling.send(ClientMessage::Accept { session_id: session_id.clone() })?;
+                    phase = Phase::AwaitingOffer { session_id };
+                } else {
+                    signaling.send(ClientMessage::Reject {
+                        session_id,
+                        reason: "rejected by the remote user".into(),
+                    })?;
+                    phase = Phase::Idle;
+                }
+            }
+            Some((session_id, reason)) = ended_rx.recv() => {
+                on_event(AgentEvent::SessionEnded { session_id, reason });
+                phase = Phase::Idle;
+                if matches!(config.consent, ConsentPolicy::Prompt) {
+                    password = credentials::generate_password()?;
+                    on_event(AgentEvent::PasswordChanged { password: password.clone() });
+                }
+            }
+        }
+    }
+
+    if let Phase::Active { stop, .. } = &phase {
+        let _ = stop.send(true);
+    }
+    Err(anyhow!("signaling connection lost"))
+}
+
+/// Runs one accepted session to completion. Returns the end reason.
+async fn run_session(
+    config: &AgentConfig,
+    session_id: &str,
+    offer: &str,
+    signaling: &SignalingSender,
+    mut stop: watch::Receiver<bool>,
+) -> Result<String> {
+    let (mut peer, mut events) = Peer::new(Role::Agent, &config.transport).await?;
+    let answer = peer.answer_offer(offer).await?;
+    signaling.send(ClientMessage::Sdp { session_id: session_id.to_owned(), sdp: answer })?;
+
+    let stop_capture = Arc::new(AtomicBool::new(false));
+    let keyframe = Arc::new(AtomicBool::new(true));
+    let (frames_tx, mut frames_rx) = mpsc::channel::<(EncodedFrame, Duration)>(2);
+    let (dims_tx, dims_rx) = tokio::sync::oneshot::channel();
+    let capture = spawn_capture(
+        config.display,
+        config.encoder,
+        frames_tx,
+        keyframe.clone(),
+        stop_capture.clone(),
+        dims_tx,
+    );
+    let (width, height) = dims_rx.await.context("capture thread died")??;
+
+    let (input_tx, input_thread) = spawn_input(config.display)?;
+
+    let reason = loop {
+        tokio::select! {
+            _ = stop.changed() => break "ended by viewer".to_string(),
+            frame = frames_rx.recv() => {
+                let Some((frame, duration)) = frame else {
+                    break "screen capture stopped".to_string();
+                };
+                if let Err(e) = peer.send_video_frame(frame.data, duration).await {
+                    tracing::debug!("video send failed: {e}");
+                }
+            }
+            evt = events.recv() => {
+                let Some(evt) = evt else { break "connection closed".to_string() };
+                match evt {
+                    PeerEvent::State(ConnectionState::Connected) => {
+                        tracing::info!("session {session_id}: peer connected");
+                        keyframe.store(true, Ordering::Relaxed);
+                    }
+                    PeerEvent::State(s @ (ConnectionState::Failed | ConnectionState::Closed)) => {
+                        break format!("connection {s}");
+                    }
+                    PeerEvent::ControlOpen => {
+                        let _ = peer.send_control(&ControlMessage::ScreenInfo { width, height }).await;
+                    }
+                    PeerEvent::ControlClosed => break "control channel closed".to_string(),
+                    PeerEvent::Control(ControlMessage::RequestKeyframe) => {
+                        keyframe.store(true, Ordering::Relaxed);
+                    }
+                    PeerEvent::Control(ControlMessage::Bye) => break "ended by viewer".to_string(),
+                    PeerEvent::Control(msg) => {
+                        if input_tx.send(msg).is_err() {
+                            break "input thread stopped".to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    };
+
+    stop_capture.store(true, Ordering::Relaxed);
+    drop(frames_rx);
+    drop(input_tx); // input thread releases held keys and exits
+    peer.close().await;
+    let _ = tokio::task::spawn_blocking(move || {
+        let _ = capture.join();
+        let _ = input_thread.join();
+    })
+    .await;
+    Ok(reason)
+}
+
+/// Capture + encode loop on a dedicated thread (capture handles are
+/// thread-affine on Windows, and encoding is CPU-bound).
+fn spawn_capture(
+    display: Option<usize>,
+    settings: EncoderSettings,
+    frames: mpsc::Sender<(EncodedFrame, Duration)>,
+    keyframe: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    dims: tokio::sync::oneshot::Sender<Result<(u32, u32)>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("vv-capture".into())
+        .spawn(move || {
+            let init = (|| -> Result<_> {
+                let capturer = vv_capture::XcapCapturer::open(display)?;
+                let (w, h) = capturer.dimensions();
+                let encoder = H264Encoder::new(w, h, settings)?;
+                Ok((capturer, encoder))
+            })();
+            let (mut capturer, mut encoder) = match init {
+                Ok(v) => {
+                    let _ = dims.send(Ok(v.1.dimensions()));
+                    v
+                }
+                Err(e) => {
+                    let _ = dims.send(Err(e));
+                    return;
+                }
+            };
+            let interval = Duration::from_secs_f32(1.0 / settings.max_fps.max(1.0));
+            let mut last = Instant::now();
+            let mut stats = (Instant::now(), 0u32, 0usize);
+            while !stop.load(Ordering::Relaxed) {
+                let started = Instant::now();
+                let frame = match capturer.capture() {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!("capture failed: {e:#}");
+                        std::thread::sleep(Duration::from_millis(200));
+                        continue;
+                    }
+                };
+                if vv_codec::even_dimensions(frame.width, frame.height) != encoder.dimensions() {
+                    match H264Encoder::new(frame.width, frame.height, settings) {
+                        Ok(e) => encoder = e,
+                        Err(e) => {
+                            tracing::error!("recreating encoder: {e:#}");
+                            break;
+                        }
+                    }
+                }
+                if keyframe.swap(false, Ordering::Relaxed) {
+                    encoder.request_keyframe();
+                }
+                match encoder.encode_rgba(&frame.rgba, frame.width, frame.height) {
+                    Ok(Some(encoded)) => {
+                        let now = Instant::now();
+                        let duration = now - last;
+                        last = now;
+                        stats.1 += 1;
+                        stats.2 += encoded.data.len();
+                        // Blocking send = backpressure. Dropping encoded frames
+                        // would break the H.264 reference chain.
+                        if frames.blocking_send((encoded, duration)).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!("encode failed: {e:#}"),
+                }
+                if stats.0.elapsed() >= Duration::from_secs(5) {
+                    let secs = stats.0.elapsed().as_secs_f32();
+                    tracing::info!(
+                        fps = format!("{:.1}", stats.1 as f32 / secs),
+                        kbps = format!("{:.0}", stats.2 as f32 * 8.0 / 1000.0 / secs),
+                        "stream stats"
+                    );
+                    stats = (Instant::now(), 0, 0);
+                }
+                if let Some(rest) = interval.checked_sub(started.elapsed()) {
+                    std::thread::sleep(rest);
+                }
+            }
+            tracing::info!("capture thread stopped");
+        })
+        .expect("spawning capture thread")
+}
+
+/// Input injection on a dedicated thread (injectors are thread-affine).
+fn spawn_input(
+    display: Option<usize>,
+) -> Result<(std::sync::mpsc::Sender<ControlMessage>, std::thread::JoinHandle<()>)> {
+    let displays = vv_capture::list_displays()?;
+    let info = match display {
+        Some(i) => displays.get(i).cloned(),
+        None => displays.iter().find(|d| d.primary).or(displays.first()).cloned(),
+    }
+    .ok_or_else(|| anyhow!("no display to control"))?;
+    let bounds = vv_input::DisplayBounds {
+        x: info.x,
+        y: info.y,
+        width: info.width,
+        height: info.height,
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<ControlMessage>();
+    let handle = std::thread::Builder::new()
+        .name("vv-input".into())
+        .spawn(move || {
+            let mut injector = match vv_input::native_injector(bounds) {
+                Ok(i) => i,
+                Err(e) => {
+                    // Degrade to view-only instead of ending the session.
+                    tracing::error!("input injection unavailable, session is view-only: {e:#}");
+                    for _ in rx {}
+                    return;
+                }
+            };
+            for msg in rx {
+                if let Err(e) = vv_input::apply(injector.as_mut(), &msg) {
+                    tracing::warn!("input injection failed: {e:#}");
+                }
+            }
+            let _ = injector.release_all();
+        })?;
+    Ok((tx, handle))
+}
+
+/// Displays available for sharing.
+pub fn list_displays() -> Result<Vec<vv_capture::DisplayInfo>> {
+    vv_capture::list_displays()
+}

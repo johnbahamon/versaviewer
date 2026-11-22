@@ -1,0 +1,30 @@
+# Phase 0 dev infrastructure: signaling relay + TURN server.
+#
+#   cd infra && VV_PUBLIC_IP=192.168.1.9 docker compose up -d
+#
+# VV_PUBLIC_IP must be an address the agent and viewer can reach (LAN IP of
+# this machine for local tests; the public IP in a real deployment).
+services:
+  signaling:
+    build: ../services/signaling
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      HOST: "0.0.0.0"
+    restart: unless-stopped
+
+  coturn:
+    image: coturn/coturn:4.6.3
+    command:
+      - -c
+      - /etc/coturn/turnserver.conf
+      - --external-ip=${VV_PUBLIC_IP:?set VV_PUBLIC_IP to this host's reachable IP}
+      - --user=${VV_TURN_USER:-versaviewer}:${VV_TURN_PASS:-change-me-now}
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "49160-49200:49160-49200/udp"
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    restart: unless-stopped

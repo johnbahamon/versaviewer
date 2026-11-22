@@ -1,0 +1,11 @@
+[package]
+name = "vv-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+tracing = "0.1.44"
+xcap = "0.9.10"
