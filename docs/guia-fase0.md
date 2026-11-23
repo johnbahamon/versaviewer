@@ -17,7 +17,7 @@ P2P cifrados (DTLS-SRTP); el servidor solo intercambia el SDP.
 En el Mac (ya instalado en este equipo):
 
 ```sh
-brew install rustup llvm
+brew install rustup llvm nasm   # nasm: ensamblador SIMD de OpenH264 para x86 (¡imprescindible!)
 rustup default stable
 rustup target add x86_64-pc-windows-msvc
 cargo install --locked cargo-xwin
