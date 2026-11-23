@@ -19,6 +19,13 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+/// Default log filter. ICE probes every local interface, so virtual adapters
+/// (VirtualBox, WSL/Hyper-V, VMware...) produce "network unreachable" send
+/// errors and DTLS/ICE emit setup chatter: all expected and harmless, so they
+/// are hidden. Set `RUST_LOG=debug` to see everything.
+const DEFAULT_LOG_FILTER: &str =
+    "info,rtc=warn,rtc_ice=error,rtc_dtls=error,webrtc=warn,webrtc::peer_connection::driver=off";
+
 #[derive(Parser)]
 #[command(name = "vv-viewer", version, about = "VersaViewer viewer: view and control a remote device")]
 struct Cli {
@@ -314,7 +321,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,rtc=warn,rtc_ice=warn,webrtc=warn".into()),
+                .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into()),
         )
         .init();
     let cli = Cli::parse();

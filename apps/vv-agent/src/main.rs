@@ -10,6 +10,13 @@ use vv_engine::agent::{AgentConfig, AgentEvent, ConsentPolicy, ConsentPrompt, Co
 use vv_engine::credentials::format_device_id;
 use vv_engine::{EncoderSettings, TransportConfig};
 
+/// Default log filter. ICE probes every local interface, so virtual adapters
+/// (VirtualBox, WSL/Hyper-V, VMware...) produce "network unreachable" send
+/// errors and DTLS/ICE emit setup chatter: all expected and harmless, so they
+/// are hidden. Set `RUST_LOG=debug` to see everything.
+const DEFAULT_LOG_FILTER: &str =
+    "info,rtc=warn,rtc_ice=error,rtc_dtls=error,webrtc=warn,webrtc::peer_connection::driver=off";
+
 #[derive(Parser)]
 #[command(name = "vv-agent", version, about = "VersaViewer agent: share this screen for remote assistance")]
 struct Cli {
@@ -160,7 +167,7 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,rtc=warn,rtc_ice=warn,webrtc=warn".into()),
+                .unwrap_or_else(|_| DEFAULT_LOG_FILTER.into()),
         )
         .init();
     let cli = Cli::parse();
