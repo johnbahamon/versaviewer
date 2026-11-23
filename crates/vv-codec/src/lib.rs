@@ -15,7 +15,7 @@
 pub mod convert;
 
 use anyhow::{Context, Result};
-pub use convert::{PixelOrder, RawImage, fit_within};
+pub use convert::{PixelOrder, RawImage, RawNv12, fit_within};
 use convert::I420Buffer;
 use openh264::OpenH264API;
 use openh264::decoder::Decoder;
@@ -136,6 +136,30 @@ impl H264Encoder {
         );
         let t0 = Instant::now();
         self.yuv.fill_from(src);
+        let t1 = Instant::now();
+        let bitstream = self.inner.encode(&self.yuv).context("encoding frame")?;
+        let frame_type = bitstream.frame_type();
+        let data = bitstream.to_vec();
+        self.timings = EncodeTimings { convert: t1 - t0, encode: t1.elapsed() };
+        if matches!(frame_type, FrameType::Skip | FrameType::Invalid) || data.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(EncodedFrame { data, keyframe: matches!(frame_type, FrameType::IDR | FrameType::I) }))
+    }
+
+    /// Encodes an NV12 frame that is already at the encoded size (GPU path:
+    /// scaling and colour conversion were done by the video processor).
+    pub fn encode_nv12(&mut self, src: &RawNv12<'_>) -> Result<Option<EncodedFrame>> {
+        anyhow::ensure!(
+            (src.width, src.height) == self.dimensions(),
+            "NV12 frame {}x{} does not match encoder output {}x{}",
+            src.width,
+            src.height,
+            self.dimensions().0,
+            self.dimensions().1
+        );
+        let t0 = Instant::now();
+        self.yuv.fill_from_nv12(src);
         let t1 = Instant::now();
         let bitstream = self.inner.encode(&self.yuv).context("encoding frame")?;
         let frame_type = bitstream.frame_type();

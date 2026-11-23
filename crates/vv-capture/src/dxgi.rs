@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+    D3D11_MAP_READ,
     D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
 };
@@ -30,8 +31,27 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::core::Interface;
 
+/// A desktop frame held by DXGI. The texture is only valid until this is
+/// dropped (which calls `ReleaseFrame`), so copy what you need first.
+pub struct AcquiredFrame {
+    duplication: IDXGIOutputDuplication,
+    pub texture: ID3D11Texture2D,
+}
+
+impl Drop for AcquiredFrame {
+    fn drop(&mut self) {
+        // SAFETY: paired with the successful AcquireNextFrame that created us.
+        // ACCESS_LOST here is detected again by the next acquire.
+        let _ = unsafe { self.duplication.ReleaseFrame() };
+    }
+}
+
 pub struct DxgiCapturer {
     device: ID3D11Device,
+    adapter_name: String,
+    /// Device created with `D3D11_CREATE_DEVICE_VIDEO_SUPPORT` (needed for the
+    /// GPU scaler and hardware encoders).
+    video_support: bool,
     context: ID3D11DeviceContext,
     output: IDXGIOutput1,
     duplication: Option<IDXGIOutputDuplication>,
@@ -73,26 +93,44 @@ impl DxgiCapturer {
                     if !desc.AttachedToDesktop.as_bool() || (r.left, r.top) != (x, y) {
                         continue;
                     }
+                    let adapter_desc = adapter.GetDesc1().context("GetDesc1")?;
+                    let name_len =
+                        adapter_desc.Description.iter().position(|&c| c == 0).unwrap_or(128);
+                    let adapter_name =
+                        String::from_utf16_lossy(&adapter_desc.Description[..name_len]);
                     let adapter: IDXGIAdapter = adapter.cast()?;
-                    let mut device = None;
-                    let mut context = None;
-                    D3D11CreateDevice(
-                        &adapter,
-                        D3D_DRIVER_TYPE_UNKNOWN,
-                        HMODULE::default(),
-                        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                        None,
-                        D3D11_SDK_VERSION,
-                        Some(&mut device),
-                        None,
-                        Some(&mut context),
-                    )
-                    .context("D3D11CreateDevice")?;
-                    let device = device.ok_or_else(|| anyhow!("no D3D11 device"))?;
-                    let context = context.ok_or_else(|| anyhow!("no D3D11 context"))?;
+                    let create = |flags| {
+                        let mut device = None;
+                        let mut context = None;
+                        D3D11CreateDevice(
+                            &adapter,
+                            D3D_DRIVER_TYPE_UNKNOWN,
+                            HMODULE::default(),
+                            flags,
+                            None,
+                            D3D11_SDK_VERSION,
+                            Some(&mut device),
+                            None,
+                            Some(&mut context),
+                        )
+                        .map(|()| (device, context))
+                    };
+                    let (created, video_support) = match create(
+                        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                    ) {
+                        Ok(dc) => (dc, true),
+                        Err(e) => {
+                            tracing::info!("D3D11 device without video support ({e})");
+                            (create(D3D11_CREATE_DEVICE_BGRA_SUPPORT).context("D3D11CreateDevice")?, false)
+                        }
+                    };
+                    let device = created.0.ok_or_else(|| anyhow!("no D3D11 device"))?;
+                    let context = created.1.ok_or_else(|| anyhow!("no D3D11 context"))?;
                     let output: IDXGIOutput1 = output.cast().context("IDXGIOutput1")?;
                     let mut capturer = Self {
                         device,
+                        adapter_name,
+                        video_support,
                         context,
                         output,
                         duplication: None,
@@ -149,9 +187,77 @@ impl DxgiCapturer {
         Ok(tex)
     }
 
-    fn read_back(&mut self, resource: &IDXGIResource) -> Result<Frame> {
-        let texture: ID3D11Texture2D = resource.cast().context("desktop texture")?;
-        let staging = self.staging_for(&texture)?;
+    pub fn device(&self) -> &ID3D11Device {
+        &self.device
+    }
+
+    pub fn context(&self) -> &ID3D11DeviceContext {
+        &self.context
+    }
+
+    pub fn video_support(&self) -> bool {
+        self.video_support
+    }
+
+    /// GPU (adapter) the captured display is attached to.
+    pub fn adapter_name(&self) -> &str {
+        &self.adapter_name
+    }
+
+    /// Waits up to `timeout` for a desktop change and returns the frame while
+    /// DXGI holds it. `Ok(None)`: no change (or duplication being recreated).
+    pub fn acquire(&mut self, timeout: Duration) -> Result<Option<AcquiredFrame>> {
+        if self.duplication.is_none() {
+            // Recreate with backoff: while the secure desktop (UAC/lock) is up,
+            // DuplicateOutput fails with E_ACCESSDENIED.
+            if self.retry_at.is_some_and(|t| t > Instant::now()) {
+                std::thread::sleep(timeout);
+                return Ok(None);
+            }
+            if let Err(e) = self.duplicate() {
+                tracing::debug!("DuplicateOutput failed, will retry: {e:#}");
+                self.retry_at = Some(Instant::now() + Duration::from_millis(500));
+                std::thread::sleep(timeout);
+                return Ok(None);
+            }
+        }
+        let dup = self.duplication.clone().expect("duplication present");
+
+        let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+        let mut resource: Option<IDXGIResource> = None;
+        let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+        // SAFETY: valid out-pointers; a successful acquire is released by
+        // AcquiredFrame::drop (or right below when unused).
+        match unsafe { dup.AcquireNextFrame(timeout_ms, &mut info, &mut resource) } {
+            Ok(()) => {}
+            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
+            Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
+                self.lost("access lost");
+                return Ok(None);
+            }
+            Err(e) => {
+                self.lost(&e.to_string());
+                return Ok(None);
+            }
+        }
+        // LastPresentTime == 0: only the cursor moved, the image is unchanged.
+        let changed = info.LastPresentTime != 0 || self.need_initial;
+        let texture = resource.and_then(|r| r.cast::<ID3D11Texture2D>().ok());
+        match (changed, texture) {
+            (true, Some(texture)) => {
+                self.need_initial = false;
+                Ok(Some(AcquiredFrame { duplication: dup, texture }))
+            }
+            _ => {
+                // SAFETY: paired with the successful AcquireNextFrame above.
+                let _ = unsafe { dup.ReleaseFrame() };
+                Ok(None)
+            }
+        }
+    }
+
+    fn read_back(&mut self, texture: &ID3D11Texture2D) -> Result<Frame> {
+        let staging = self.staging_for(texture)?;
         let (width, height) = self
             .staging
             .as_ref()
@@ -160,7 +266,7 @@ impl DxgiCapturer {
         // SAFETY: both textures belong to self.device; Map/Unmap are paired and
         // the mapped region is read only within RowPitch * height bytes.
         unsafe {
-            self.context.CopyResource(&staging, &texture);
+            self.context.CopyResource(&staging, texture);
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             self.context
                 .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
@@ -198,56 +304,12 @@ impl ScreenCapturer for DxgiCapturer {
     }
 
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>> {
-        if self.duplication.is_none() {
-            // Recreate with backoff: while the secure desktop (UAC/lock) is up,
-            // DuplicateOutput fails with E_ACCESSDENIED.
-            if self.retry_at.is_some_and(|t| t > Instant::now()) {
-                std::thread::sleep(timeout);
-                return Ok(None);
-            }
-            if let Err(e) = self.duplicate() {
-                tracing::debug!("DuplicateOutput failed, will retry: {e:#}");
-                self.retry_at = Some(Instant::now() + Duration::from_millis(500));
-                std::thread::sleep(timeout);
-                return Ok(None);
-            }
-        }
-        let dup = self.duplication.clone().expect("duplication present");
-
-        let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
-        let mut resource: Option<IDXGIResource> = None;
-        let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
-        // SAFETY: valid out-pointers; every successful acquire is released below.
-        match unsafe { dup.AcquireNextFrame(timeout_ms, &mut info, &mut resource) } {
-            Ok(()) => {}
-            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(None),
-            Err(e) if e.code() == DXGI_ERROR_ACCESS_LOST => {
-                self.lost("access lost");
-                return Ok(None);
-            }
-            Err(e) => {
-                self.lost(&e.to_string());
-                return Ok(None);
-            }
-        }
-
-        // LastPresentTime == 0: only the cursor moved, the image is unchanged.
-        let changed = info.LastPresentTime != 0 || self.need_initial;
-        let result = match (changed, resource.as_ref()) {
-            (true, Some(res)) => self.read_back(res).map(Some),
-            _ => Ok(None),
+        let Some(frame) = self.acquire(timeout)? else {
+            return Ok(None);
         };
-        // SAFETY: paired with the successful AcquireNextFrame above.
-        if let Err(e) = unsafe { dup.ReleaseFrame() }
-            && e.code() == DXGI_ERROR_ACCESS_LOST {
-                self.lost("access lost on release");
-            }
-        match result {
-            Ok(Some(frame)) => {
-                self.need_initial = false;
-                Ok(Some(frame))
-            }
-            other => other,
-        }
+        let texture = frame.texture.clone();
+        let result = self.read_back(&texture);
+        drop(frame); // ReleaseFrame after the copy is queued and mapped
+        result.map(Some)
     }
 }

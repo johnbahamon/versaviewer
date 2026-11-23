@@ -13,6 +13,7 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "
 tracing = "0.1.44"
 vv-capture = { version = "0.1.0", path = "../vv-capture" }
 vv-codec = { version = "0.1.0", path = "../vv-codec" }
+vv-gpu = { version = "0.1.0", path = "../vv-gpu" }
 vv-input = { version = "0.1.0", path = "../vv-input" }
 vv-protocol = { version = "0.1.0", path = "../vv-protocol" }
 vv-transport = { version = "0.1.0", path = "../vv-transport" }

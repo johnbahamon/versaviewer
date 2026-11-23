@@ -132,6 +132,24 @@ cargo run --release -p vv-engine --example headless_viewer -- \
 # RESULT frames=... size=1920x1080 avg_fps=...
 ```
 
+## Vídeo: tubería GPU (Windows)
+
+El agente usa por defecto la GPU para escalar y codificar (ver ADR-0007). En la
+consola aparece qué se está usando:
+
+```
+video pipeline ready backend="gpu" adapter="..." encoder="Intel® Quick Sync Video H.264 Encoder MFT" ...
+stream stats (gpu) fps=... capture_ms=... readback_ms=... encode_ms=...
+```
+
+Opciones para diagnosticar:
+
+| Opción | Efecto |
+|---|---|
+| `--encoder hardware` | Exige encoder por hardware (falla si no hay) |
+| `--encoder software` | Escalado en GPU + OpenH264 |
+| `--no-gpu` | Todo en CPU, como en la Fase 0 |
+
 ## Solución de problemas
 
 | Síntoma | Causa probable |

@@ -49,6 +49,7 @@ flowchart TB
 | `vv-protocol` | Mensajes JSON de señalización y de control (versión 1) | ✅ | Versionado/negociación de capacidades |
 | `vv-capture` | Captura de pantalla por cambios | DXGI Desktop Duplication (Windows), `xcap` (resto / respaldo) | Dirty rects, cursor, multi-monitor |
 | `vv-codec` | Conversión I420 multihilo con reducción por área + H.264 Annex-B | OpenH264 SW, máx. 1920×1200 | Media Foundation/NVENC/QSV, VideoToolbox |
+| `vv-gpu` | Tubería GPU Windows: escalado D3D11 + H.264 por hardware (Media Foundation) | ✅ (pendiente de validar en HW real) | Decodificación HW en el viewer, cursor, multi-monitor |
 | `vv-input` | Inyección de input con teclas físicas (W3C `code`) | SendInput (Win), enigo (otros) | Multi-monitor, SAS vía servicio |
 | `vv-transport` | WebRTC (webrtc-rs 0.21), reensamblado RTP, cliente WS | ✅ | Trickle ICE, jitter buffer, BWE → bitrate |
 | `vv-engine` | Orquestación agente/viewer, OTP, rate limit, consentimiento | ✅ | Reconexión, FFI para Flutter |
@@ -137,7 +138,7 @@ permisos del SO (blueprint §6).
 | Fase | Contenido |
 |---|---|
 | **0** ✅ | Prueba de viabilidad: agente Windows, viewer Mac, P2P/TURN, control |
-| 1 | Rendimiento: DXGI + encoder HW, trickle ICE, jitter buffer, adaptación de bitrate por BWE, métricas de latencia, icono de bandeja |
+| 1 (en curso) | Rendimiento: ✅ DXGI, ✅ escalado en GPU + encoder HW (ADR-0007), ✅ captura/codificación en paralelo; pendiente: decodificación HW en el viewer, trickle ICE, jitter buffer, adaptación de bitrate, reconexión del agente, icono de bandeja |
 | 2 | Backend NestJS (auth OIDC, dispositivos, sesiones, TURN REST credentials), `wss://`, agente como servicio de Windows (UAC, Ctrl+Alt+Supr) |
 | 3 | Portapapeles, multi-monitor, reconexión automática |
 | 4+ | Transferencia de archivos, agentes macOS/Linux, móviles, gestión empresarial (orden del blueprint §8) |

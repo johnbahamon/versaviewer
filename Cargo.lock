@@ -4045,9 +4045,21 @@ dependencies = [
  "tracing",
  "vv-capture",
  "vv-codec",
+ "vv-gpu",
  "vv-input",
  "vv-protocol",
  "vv-transport",
+]
+
+[[package]]
+name = "vv-gpu"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tracing",
+ "vv-capture",
+ "vv-codec",
+ "windows 0.62.2",
 ]
 
 [[package]]

@@ -57,6 +57,12 @@ struct Cli {
     /// Force media through TURN (tests the relay fallback).
     #[arg(long)]
     relay_only: bool,
+    /// H.264 encoder: auto (hardware if available), hardware, software.
+    #[arg(long, default_value = "auto")]
+    encoder: vv_engine::EncoderChoice,
+    /// Disable the GPU pipeline (capture + scale + encode on the CPU, as in Phase 0).
+    #[arg(long)]
+    no_gpu: bool,
 }
 
 struct LocalConsent;
@@ -207,6 +213,7 @@ async fn main() -> Result<()> {
             ..Default::default()
         },
         display: cli.display,
+        video: vv_engine::agent::VideoOptions { gpu: !cli.no_gpu, encoder: cli.encoder },
         consent: match cli.unattended_password {
             Some(password) => ConsentPolicy::Unattended { password },
             None => ConsentPolicy::Prompt,

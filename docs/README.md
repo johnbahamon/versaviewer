@@ -14,6 +14,7 @@
 | [0004](adr/0004-seguridad-fase0.md) | Seguridad Fase 0: OTP y consentimiento en el agente |
 | [0005](adr/0005-input-teclas-fisicas.md) | Input con teclas físicas y coordenadas normalizadas |
 | [0006](adr/0006-senalizacion-fase0.md) | Señalización mínima Node + ws |
+| [0007](adr/0007-tuberia-gpu.md) | Tubería de vídeo en GPU en Windows (D3D11 + Media Foundation) |
 
 ## Desarrollo
 

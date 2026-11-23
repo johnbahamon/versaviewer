@@ -148,6 +148,42 @@ impl I420Buffer {
     }
 }
 
+/// Borrowed NV12 image (Y plane + interleaved UV plane), e.g. read back
+/// from a GPU scaler that already did colour conversion and downscaling.
+#[derive(Debug, Clone, Copy)]
+pub struct RawNv12<'a> {
+    pub y: &'a [u8],
+    pub uv: &'a [u8],
+    pub width: u32,
+    pub height: u32,
+    pub y_stride: usize,
+    pub uv_stride: usize,
+}
+
+impl I420Buffer {
+    /// Copies an NV12 image of exactly this buffer's size (no scaling).
+    pub fn fill_from_nv12(&mut self, src: &RawNv12<'_>) {
+        let (w, h) = (self.width, self.height);
+        assert_eq!((src.width as usize, src.height as usize), (w, h), "NV12 size mismatch");
+        assert!(src.y_stride >= w && src.y.len() >= src.y_stride * (h - 1) + w);
+        assert!(src.uv_stride >= w && src.uv.len() >= src.uv_stride * (h / 2 - 1) + w);
+        let (y_plane, u_plane, v_plane) = self.planes_mut();
+        for row in 0..h {
+            y_plane[row * w..(row + 1) * w]
+                .copy_from_slice(&src.y[row * src.y_stride..row * src.y_stride + w]);
+        }
+        let half = w / 2;
+        for row in 0..h / 2 {
+            let uv = &src.uv[row * src.uv_stride..row * src.uv_stride + w];
+            let (u_row, v_row) = (&mut u_plane[row * half..(row + 1) * half], &mut v_plane[row * half..(row + 1) * half]);
+            for (i, pair) in uv.as_chunks::<2>().0.iter().enumerate() {
+                u_row[i] = pair[0];
+                v_row[i] = pair[1];
+            }
+        }
+    }
+}
+
 #[inline]
 fn luma(r: i32, g: i32, b: i32) -> u8 {
     clamp_u8(((66 * r + 129 * g + 25 * b + 128) >> 8) + 16)
@@ -234,6 +270,18 @@ mod tests {
         buf.fill_from(&RawImage { data: &src, width: w, height: h, stride, order: PixelOrder::Bgra });
         assert!(buf.y().iter().all(|&p| p == 41), "{:?}", buf.y());
         assert!(buf.u().iter().all(|&p| p == 240));
+    }
+
+    #[test]
+    fn nv12_is_deinterleaved_into_i420() {
+        // 4x2 image, strides with padding.
+        let y: Vec<u8> = (0..2).flat_map(|r| [10 + r, 11 + r, 12 + r, 13 + r, 0, 0]).collect();
+        let uv = [100u8, 200, 101, 201, 0, 0];
+        let mut buf = I420Buffer::new(4, 2);
+        buf.fill_from_nv12(&RawNv12 { y: &y, uv: &uv, width: 4, height: 2, y_stride: 6, uv_stride: 6 });
+        assert_eq!(buf.y(), &[10, 11, 12, 13, 11, 12, 13, 14]);
+        assert_eq!(buf.u(), &[100, 101]);
+        assert_eq!(buf.v(), &[200, 201]);
     }
 
     #[test]

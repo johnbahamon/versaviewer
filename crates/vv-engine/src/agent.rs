@@ -67,6 +67,7 @@ pub struct AgentConfig {
     pub encoder: EncoderSettings,
     pub display: Option<usize>,
     pub consent: ConsentPolicy,
+    pub video: VideoOptions,
 }
 
 type EventSink = Arc<dyn Fn(AgentEvent) + Send + Sync>;
@@ -258,9 +259,10 @@ async fn run_session(
     let connected = Arc::new(AtomicBool::new(false));
     let (frames_tx, mut frames_rx) = mpsc::channel::<(EncodedFrame, Duration)>(2);
     let (dims_tx, dims_rx) = tokio::sync::oneshot::channel();
-    let capture = spawn_capture(
+    let capture = spawn_video(
         config.display,
         config.encoder,
+        config.video,
         frames_tx,
         keyframe.clone(),
         connected.clone(),
@@ -360,15 +362,27 @@ struct CaptureCounters {
     frames: AtomicU64,
 }
 
-/// Starts the video pipeline: a capture thread and an encode thread running
-/// in parallel, so frame N+1 is captured while frame N is being encoded.
-///
-/// Change-driven: with DXGI nothing is encoded while the screen is static.
-/// The encoder keeps the last frame to answer keyframe requests and to
-/// re-send the final state if rate control skipped it.
-fn spawn_capture(
+/// Where the session's encoded video comes from.
+#[derive(Debug, Clone, Copy)]
+pub struct VideoOptions {
+    /// Try the GPU pipeline first (Windows: GPU scaling + hardware encoder).
+    pub gpu: bool,
+    pub encoder: vv_gpu::EncoderChoice,
+}
+
+impl Default for VideoOptions {
+    fn default() -> Self {
+        Self { gpu: true, encoder: vv_gpu::EncoderChoice::Auto }
+    }
+}
+
+/// Starts the video thread: the GPU pipeline when available, otherwise (or
+/// if it fails mid-session) the CPU pipeline.
+#[allow(clippy::too_many_arguments)]
+fn spawn_video(
     display: Option<usize>,
     settings: EncoderSettings,
+    options: VideoOptions,
     frames: mpsc::Sender<(EncodedFrame, Duration)>,
     keyframe: Arc<AtomicBool>,
     connected: Arc<AtomicBool>,
@@ -376,136 +390,297 @@ fn spawn_capture(
     dims: tokio::sync::oneshot::Sender<Result<(u32, u32)>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
-        .name("vv-encode".into())
+        .name("vv-video".into())
         .spawn(move || {
-            let interval = Duration::from_secs_f32(1.0 / settings.max_fps.max(1.0));
-            let mailbox = Arc::new(Mailbox { slot: Mutex::new(None), ready: Condvar::new() });
-            let counters = Arc::new(CaptureCounters::default());
-            let (recycle_tx, recycle_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-            let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<&'static str>>();
-
-            let capture_thread = {
-                let (mailbox, counters, stop) = (mailbox.clone(), counters.clone(), stop.clone());
-                std::thread::Builder::new()
-                    .name("vv-capture".into())
-                    .spawn(move || {
-                        capture_loop(display, interval, &mailbox, &counters, &recycle_rx, &stop, init_tx)
-                    })
-                    .expect("spawning capture thread")
-            };
-
-            let init = (|| -> Result<_> {
-                let backend = init_rx.recv().map_err(|_| anyhow!("capture thread died"))??;
-                let first = mailbox
-                    .take(Duration::from_secs(3))
-                    .ok_or_else(|| anyhow!("no initial frame from capturer"))?;
-                let encoder = H264Encoder::new(first.width, first.height, settings)?;
-                Ok((backend, encoder, first))
-            })();
-            let (backend, mut encoder, mut last) = match init {
-                Ok(v) => {
-                    let _ = dims.send(Ok(v.1.dimensions()));
-                    v
-                }
-                Err(e) => {
-                    let _ = dims.send(Err(e));
-                    stop.store(true, Ordering::Relaxed);
-                    let _ = capture_thread.join();
-                    return;
-                }
-            };
-            tracing::info!(
-                backend,
-                source = format!("{}x{}", last.width, last.height),
-                encoded = format!("{}x{}", encoder.dimensions().0, encoder.dimensions().1),
-                "video pipeline ready"
-            );
-
-            let mut last_encode = Instant::now() - interval;
-            let mut fresh = true; // `last` has not been sent yet
-            let mut needs_refresh = false; // last encode was skipped by rate control
-            let mut stats = Stats::new();
-            while !stop.load(Ordering::Relaxed) {
-                if let Some(rest) = interval.checked_sub(last_encode.elapsed()) {
-                    std::thread::sleep(rest);
-                }
-                let want_keyframe = keyframe.swap(false, Ordering::Relaxed);
-                match mailbox.take(Duration::from_millis(100)) {
-                    Some(f) => {
-                        let old = std::mem::replace(&mut last, f);
-                        let _ = recycle_tx.send(old.data);
-                        fresh = true;
-                    }
-                    None if !(want_keyframe || needs_refresh || fresh) => continue,
-                    None => {}
-                }
-                if !connected.load(Ordering::Relaxed) {
-                    // Nothing can be sent yet: keep the newest frame and the
-                    // keyframe request for when the connection is up.
-                    if want_keyframe {
+            let mut dims = Some(dims);
+            if options.gpu {
+                match vv_gpu::GpuPipeline::open(display, settings, options.encoder) {
+                    Ok(pipeline) => {
+                        let info = pipeline.info().clone();
+                        tracing::info!(
+                            backend = "gpu",
+                            adapter = %info.adapter,
+                            encoder = %info.encoder,
+                            source = format!("{}x{}", info.source.0, info.source.1),
+                            encoded = format!("{}x{}", info.encoded.0, info.encoded.1),
+                            "video pipeline ready"
+                        );
+                        if let Some(d) = dims.take() {
+                            let _ = d.send(Ok(info.encoded));
+                        }
+                        match run_gpu_pipeline(pipeline, settings, &frames, &keyframe, &connected, &stop) {
+                            Ok(()) => return,
+                            Err(e) => tracing::warn!("GPU video pipeline failed, switching to CPU: {e:#}"),
+                        }
                         keyframe.store(true, Ordering::Relaxed);
                     }
-                    std::thread::sleep(Duration::from_millis(20));
-                    continue;
+                    Err(e) => tracing::info!("GPU video pipeline unavailable, using CPU: {e:#}"),
                 }
+            }
+            run_cpu_pipeline(display, settings, frames, keyframe, connected, stop, dims);
+        })
+        .expect("spawning video thread")
+}
 
-                if encoder.source_dimensions() != (last.width, last.height) {
-                    match H264Encoder::new(last.width, last.height, settings) {
-                        Ok(e) => {
-                            tracing::info!(
-                                source = format!("{}x{}", last.width, last.height),
-                                "display resolution changed; encoder recreated"
-                            );
-                            encoder = e;
-                        }
-                        Err(e) => {
-                            tracing::error!("recreating encoder: {e:#}");
-                            break;
-                        }
-                    }
+/// GPU pipeline loop. Returns `Ok` when the session ends, `Err` if the
+/// pipeline broke (the caller falls back to the CPU pipeline).
+fn run_gpu_pipeline(
+    mut pipeline: vv_gpu::GpuPipeline,
+    settings: EncoderSettings,
+    frames: &mpsc::Sender<(EncodedFrame, Duration)>,
+    keyframe: &AtomicBool,
+    connected: &AtomicBool,
+    stop: &AtomicBool,
+) -> Result<()> {
+    let interval = Duration::from_secs_f32(1.0 / settings.max_fps.max(1.0));
+    let mut last_encode = Instant::now() - interval;
+    let mut failures = 0u32;
+    let mut stats = GpuStats::new();
+    while !stop.load(Ordering::Relaxed) {
+        if let Some(rest) = interval.checked_sub(last_encode.elapsed()) {
+            std::thread::sleep(rest);
+        }
+        if !connected.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        let want_keyframe = keyframe.swap(false, Ordering::Relaxed);
+        if want_keyframe {
+            pipeline.request_keyframe();
+        }
+        let started = Instant::now();
+        let produced = match pipeline.poll(Duration::from_millis(100), want_keyframe) {
+            Ok(p) => {
+                failures = 0;
+                p
+            }
+            Err(e) => {
+                failures += 1;
+                tracing::warn!("GPU pipeline error ({failures}/3): {e:#}");
+                if failures >= 3 {
+                    return Err(e);
                 }
-                if want_keyframe {
-                    encoder.request_keyframe();
+                keyframe.store(true, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
+        if produced.is_empty() {
+            // No change, or the encoder had nothing ready yet (the pipeline
+            // retries pending pictures by itself on the next poll).
+            continue;
+        }
+        let duration = started - last_encode;
+        last_encode = started;
+        stats.add(&pipeline.last_timings(), &produced);
+        for frame in produced {
+            if frames.blocking_send((frame, duration)).is_err() {
+                return Ok(());
+            }
+        }
+        stats.maybe_log(&pipeline);
+    }
+    Ok(())
+}
+
+struct GpuStats {
+    since: Instant,
+    frames: u32,
+    bytes: usize,
+    capture: Duration,
+    readback: Duration,
+    encode: Duration,
+}
+
+impl GpuStats {
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            frames: 0,
+            bytes: 0,
+            capture: Duration::ZERO,
+            readback: Duration::ZERO,
+            encode: Duration::ZERO,
+        }
+    }
+
+    fn add(&mut self, t: &vv_gpu::GpuTimings, frames: &[EncodedFrame]) {
+        self.frames += frames.len() as u32;
+        self.bytes += frames.iter().map(|f| f.data.len()).sum::<usize>();
+        self.capture += t.capture;
+        self.readback += t.readback;
+        self.encode += t.encode;
+    }
+
+    fn maybe_log(&mut self, pipeline: &vv_gpu::GpuPipeline) {
+        let secs = self.since.elapsed().as_secs_f32();
+        if secs < 5.0 {
+            return;
+        }
+        let per = |d: Duration| d.as_secs_f32() * 1000.0 / self.frames.max(1) as f32;
+        let info = pipeline.info();
+        tracing::info!(
+            fps = format!("{:.1}", self.frames as f32 / secs),
+            kbps = format!("{:.0}", self.bytes as f32 * 8.0 / 1000.0 / secs),
+            capture_ms = format!("{:.1}", per(self.capture)),
+            readback_ms = format!("{:.1}", per(self.readback)),
+            encode_ms = format!("{:.1}", per(self.encode)),
+            res = format!("{}x{}->{}x{}", info.source.0, info.source.1, info.encoded.0, info.encoded.1),
+            encoder = %info.encoder,
+            "stream stats (gpu)"
+        );
+        *self = Self::new();
+    }
+}
+
+/// CPU pipeline: a capture thread and an encode thread (this one) running in
+/// parallel, so frame N+1 is captured while frame N is being encoded.
+///
+/// Change-driven: with DXGI nothing is encoded while the screen is static.
+/// The encoder keeps the last frame to answer keyframe requests and to
+/// re-send the final state if rate control skipped it.
+fn run_cpu_pipeline(
+    display: Option<usize>,
+    settings: EncoderSettings,
+    frames: mpsc::Sender<(EncodedFrame, Duration)>,
+    keyframe: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    dims: Option<tokio::sync::oneshot::Sender<Result<(u32, u32)>>>,
+) {
+    let interval = Duration::from_secs_f32(1.0 / settings.max_fps.max(1.0));
+    let mailbox = Arc::new(Mailbox { slot: Mutex::new(None), ready: Condvar::new() });
+    let counters = Arc::new(CaptureCounters::default());
+    let (recycle_tx, recycle_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<&'static str>>();
+
+    let capture_thread = {
+        let (mailbox, counters, stop) = (mailbox.clone(), counters.clone(), stop.clone());
+        std::thread::Builder::new()
+            .name("vv-capture".into())
+            .spawn(move || {
+                capture_loop(display, interval, &mailbox, &counters, &recycle_rx, &stop, init_tx)
+            })
+            .expect("spawning capture thread")
+    };
+
+    let init = (|| -> Result<_> {
+        let backend = init_rx.recv().map_err(|_| anyhow!("capture thread died"))??;
+        let first = mailbox
+            .take(Duration::from_secs(3))
+            .ok_or_else(|| anyhow!("no initial frame from capturer"))?;
+        let encoder = H264Encoder::new(first.width, first.height, settings)?;
+        Ok((backend, encoder, first))
+    })();
+    let (backend, mut encoder, mut last) = match init {
+        Ok(v) => {
+            if let Some(dims) = dims {
+                let _ = dims.send(Ok(v.1.dimensions()));
+            }
+            v
+        }
+        Err(e) => {
+            match dims {
+                Some(dims) => {
+                    let _ = dims.send(Err(e));
                 }
-                let image = vv_codec::RawImage {
-                    data: &last.data,
-                    width: last.width,
-                    height: last.height,
-                    stride: last.stride,
-                    order: match last.format {
-                        vv_capture::PixelFormat::Rgba8 => vv_codec::PixelOrder::Rgba,
-                        vv_capture::PixelFormat::Bgra8 => vv_codec::PixelOrder::Bgra,
-                    },
-                };
-                let started = Instant::now();
-                let encoded = encoder.encode(&image);
-                let duration = started - last_encode;
-                last_encode = started;
-                fresh = false;
-                let t = encoder.last_timings();
-                stats.convert += t.convert;
-                stats.encode += t.encode;
-                match encoded {
-                    Ok(Some(encoded)) => {
-                        needs_refresh = false;
-                        stats.frames += 1;
-                        stats.bytes += encoded.data.len();
-                        // Blocking send = backpressure. Dropping encoded frames
-                        // would break the H.264 reference chain.
-                        if frames.blocking_send((encoded, duration)).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => needs_refresh = true,
-                    Err(e) => tracing::warn!("encode failed: {e:#}"),
-                }
-                stats.maybe_log(backend, &encoder, &counters);
+                None => tracing::error!("CPU video pipeline failed: {e:#}"),
             }
             stop.store(true, Ordering::Relaxed);
             let _ = capture_thread.join();
-            tracing::info!("video pipeline stopped");
-        })
-        .expect("spawning encode thread")
+            return;
+        }
+    };
+    tracing::info!(
+        backend,
+        source = format!("{}x{}", last.width, last.height),
+        encoded = format!("{}x{}", encoder.dimensions().0, encoder.dimensions().1),
+        "video pipeline ready"
+    );
+
+    let mut last_encode = Instant::now() - interval;
+    let mut fresh = true; // `last` has not been sent yet
+    let mut needs_refresh = false; // last encode was skipped by rate control
+    let mut stats = Stats::new();
+    while !stop.load(Ordering::Relaxed) {
+        if let Some(rest) = interval.checked_sub(last_encode.elapsed()) {
+            std::thread::sleep(rest);
+        }
+        let want_keyframe = keyframe.swap(false, Ordering::Relaxed);
+        match mailbox.take(Duration::from_millis(100)) {
+            Some(f) => {
+                let old = std::mem::replace(&mut last, f);
+                let _ = recycle_tx.send(old.data);
+                fresh = true;
+            }
+            None if !(want_keyframe || needs_refresh || fresh) => continue,
+            None => {}
+        }
+        if !connected.load(Ordering::Relaxed) {
+            // Nothing can be sent yet: keep the newest frame and the
+            // keyframe request for when the connection is up.
+            if want_keyframe {
+                keyframe.store(true, Ordering::Relaxed);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+
+        if encoder.source_dimensions() != (last.width, last.height) {
+            match H264Encoder::new(last.width, last.height, settings) {
+                Ok(e) => {
+                    tracing::info!(
+                        source = format!("{}x{}", last.width, last.height),
+                        "display resolution changed; encoder recreated"
+                    );
+                    encoder = e;
+                }
+                Err(e) => {
+                    tracing::error!("recreating encoder: {e:#}");
+                    break;
+                }
+            }
+        }
+        if want_keyframe {
+            encoder.request_keyframe();
+        }
+        let image = vv_codec::RawImage {
+            data: &last.data,
+            width: last.width,
+            height: last.height,
+            stride: last.stride,
+            order: match last.format {
+                vv_capture::PixelFormat::Rgba8 => vv_codec::PixelOrder::Rgba,
+                vv_capture::PixelFormat::Bgra8 => vv_codec::PixelOrder::Bgra,
+            },
+        };
+        let started = Instant::now();
+        let encoded = encoder.encode(&image);
+        let duration = started - last_encode;
+        last_encode = started;
+        fresh = false;
+        let t = encoder.last_timings();
+        stats.convert += t.convert;
+        stats.encode += t.encode;
+        match encoded {
+            Ok(Some(encoded)) => {
+                needs_refresh = false;
+                stats.frames += 1;
+                stats.bytes += encoded.data.len();
+                // Blocking send = backpressure. Dropping encoded frames
+                // would break the H.264 reference chain.
+                if frames.blocking_send((encoded, duration)).is_err() {
+                    break;
+                }
+            }
+            Ok(None) => needs_refresh = true,
+            Err(e) => tracing::warn!("encode failed: {e:#}"),
+        }
+        stats.maybe_log(backend, &encoder, &counters);
+    }
+    stop.store(true, Ordering::Relaxed);
+    let _ = capture_thread.join();
+    tracing::info!("video pipeline stopped");
 }
 
 fn capture_loop(

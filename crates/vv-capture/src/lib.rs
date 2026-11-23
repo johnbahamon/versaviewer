@@ -96,7 +96,8 @@ pub fn list_displays() -> Result<Vec<DisplayInfo>> {
         .collect())
 }
 
-fn pick_display(index: Option<usize>) -> Result<DisplayInfo> {
+/// The display at `index`, or the primary one when `None`.
+pub fn pick_display(index: Option<usize>) -> Result<DisplayInfo> {
     let displays = list_displays()?;
     match index {
         Some(i) => displays.get(i).cloned().ok_or_else(|| anyhow!("no display #{i}")),

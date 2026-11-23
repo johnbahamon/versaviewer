@@ -198,6 +198,7 @@ fn spawn_decoder(sink: Sink) -> std::sync::mpsc::Sender<Bytes> {
                     return;
                 }
             };
+            let mut errors = 0u32;
             let (mut since, mut frames, mut bytes, mut busy) =
                 (Instant::now(), 0u32, 0usize, Duration::ZERO);
             for au in rx {
@@ -211,7 +212,12 @@ fn spawn_decoder(sink: Sink) -> std::sync::mpsc::Sender<Bytes> {
                         sink(ViewerEvent::Frame(frame));
                     }
                     Ok(None) => {}
-                    Err(e) => tracing::debug!("decode error: {e:#}"),
+                    Err(e) => {
+                        errors += 1;
+                        if errors == 1 || errors.is_multiple_of(100) {
+                            tracing::warn!("H.264 decode error #{errors}: {e:#}");
+                        }
+                    }
                 }
                 let secs = since.elapsed().as_secs_f32();
                 if secs >= 5.0 {
@@ -219,6 +225,7 @@ fn spawn_decoder(sink: Sink) -> std::sync::mpsc::Sender<Bytes> {
                         fps = format!("{:.1}", frames as f32 / secs),
                         kbps = format!("{:.0}", bytes as f32 * 8.0 / 1000.0 / secs),
                         decode_ms = format!("{:.1}", busy.as_secs_f32() * 1000.0 / frames.max(1) as f32),
+                        decode_errors = errors,
                         "receive stats"
                     );
                     (since, frames, bytes, busy) = (Instant::now(), 0, 0, Duration::ZERO);

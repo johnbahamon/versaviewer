@@ -12,5 +12,6 @@ pub mod credentials;
 pub mod viewer;
 
 pub use vv_codec::{DecodedFrame, EncoderSettings};
+pub use vv_gpu::EncoderChoice;
 pub use vv_protocol::control::{ControlMessage, MouseButton};
 pub use vv_transport::TransportConfig;
