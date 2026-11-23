@@ -4,3 +4,5 @@ services/signaling/dist/
 .DS_Store
 *.log
 .env
+
+smoke-logs/

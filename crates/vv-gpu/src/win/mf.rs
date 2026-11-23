@@ -70,7 +70,7 @@ fn pack(hi: u32, lo: u32) -> u64 {
     (u64::from(hi) << 32) | u64::from(lo)
 }
 
-fn friendly_name(activate: &IMFActivate) -> String {
+pub(crate) fn friendly_name(activate: &IMFActivate) -> String {
     // SAFETY: buffer sized from GetStringLength (+1 for the terminator).
     unsafe {
         let Ok(len) = activate.GetStringLength(&MFT_FRIENDLY_NAME_Attribute) else {
@@ -85,7 +85,7 @@ fn friendly_name(activate: &IMFActivate) -> String {
 }
 
 /// Hardware H.264 encoder MFTs registered on this machine, best first.
-fn enumerate() -> Result<Vec<IMFActivate>> {
+pub(crate) fn enumerate() -> Result<Vec<IMFActivate>> {
     let input = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_NV12 };
     let output = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: MFVideoFormat_H264 };
     let mut array: *mut Option<IMFActivate> = std::ptr::null_mut();

@@ -59,7 +59,7 @@ pub struct GpuTimings {
 #[cfg(windows)]
 mod win;
 #[cfg(windows)]
-pub use win::GpuPipeline;
+pub use win::{GpuPipeline, diagnose};
 
 #[cfg(not(windows))]
 mod stub {
@@ -94,6 +94,12 @@ mod stub {
 }
 #[cfg(not(windows))]
 pub use stub::GpuPipeline;
+
+/// Human-readable report of what the GPU pipeline can use on this machine.
+#[cfg(not(windows))]
+pub fn diagnose(_display: Option<usize>) -> Vec<String> {
+    vec!["GPU pipeline: only available on Windows -> the agent uses the CPU pipeline".into()]
+}
 
 #[cfg(test)]
 mod tests {

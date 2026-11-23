@@ -21,8 +21,8 @@ const DEFAULT_LOG_FILTER: &str =
 #[command(name = "vv-agent", version, about = "VersaViewer agent: share this screen for remote assistance")]
 struct Cli {
     /// Signaling server URL, e.g. ws://192.168.1.20:8080
-    #[arg(short, long, env = "VV_SERVER")]
-    server: String,
+    #[arg(short, long, env = "VV_SERVER", required_unless_present_any = ["probe", "list_displays"])]
+    server: Option<String>,
     /// Fixed 9-digit device ID (random if omitted).
     #[arg(long, env = "VV_DEVICE_ID")]
     id: Option<String>,
@@ -35,6 +35,9 @@ struct Cli {
     display: Option<usize>,
     #[arg(long)]
     list_displays: bool,
+    /// Print what video capture/encoding this machine supports, then exit.
+    #[arg(long)]
+    probe: bool,
     #[arg(long, default_value_t = 30.0)]
     fps: f32,
     /// Video bitrate in kbit/s.
@@ -178,6 +181,14 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
 
+    if cli.probe {
+        println!("VersaViewer agent {} — video probe", env!("CARGO_PKG_VERSION"));
+        for line in vv_engine::agent::probe(cli.display) {
+            println!("  {line}");
+        }
+        return Ok(());
+    }
+
     if cli.list_displays {
         for d in vv_engine::agent::list_displays()? {
             println!(
@@ -196,7 +207,7 @@ async fn main() -> Result<()> {
 
     let unattended = cli.unattended_password.is_some();
     let config = AgentConfig {
-        signaling_url: cli.server,
+        signaling_url: cli.server.expect("--server is required"),
         device_id: cli.id,
         transport: TransportConfig::from_options(
             cli.stun,

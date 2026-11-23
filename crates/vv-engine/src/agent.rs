@@ -822,6 +822,25 @@ pub fn platform_init() {
     vv_capture::platform_init();
 }
 
+/// Diagnostic report of the video capabilities of this machine (no session needed).
+pub fn probe(display: Option<usize>) -> Vec<String> {
+    let mut out = Vec::new();
+    match vv_capture::list_displays() {
+        Ok(ds) => {
+            for d in ds {
+                out.push(format!(
+                    "Display #{}: {} {}x{} at ({},{}){}",
+                    d.index, d.name, d.width, d.height, d.x, d.y,
+                    if d.primary { " [primary]" } else { "" }
+                ));
+            }
+        }
+        Err(e) => out.push(format!("Displays: enumeration failed ({e:#})")),
+    }
+    out.extend(vv_gpu::diagnose(display));
+    out
+}
+
 /// Displays available for sharing.
 pub fn list_displays() -> Result<Vec<vv_capture::DisplayInfo>> {
     vv_capture::list_displays()

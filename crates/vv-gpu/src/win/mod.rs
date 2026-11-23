@@ -273,3 +273,56 @@ impl GpuPipeline {
         Ok(frames)
     }
 }
+
+/// Human-readable report of what the GPU pipeline can use on this machine.
+/// Never fails: every problem becomes a line of the report.
+pub fn diagnose(display: Option<usize>) -> Vec<String> {
+    let mut out = Vec::new();
+    let runtime = match Runtime::start() {
+        Ok(r) => r,
+        Err(e) => return vec![format!("Media Foundation: NOT available ({e:#})")],
+    };
+    out.push("Media Foundation: available".into());
+
+    match vv_capture::pick_display(display) {
+        Ok(d) => out.push(format!("Display: #{} {} {}x{} at ({},{})", d.index, d.name, d.width, d.height, d.x, d.y)),
+        Err(e) => out.push(format!("Display: none ({e:#})")),
+    }
+    match vv_capture::pick_display(display).and_then(|d| DxgiCapturer::open(d.x, d.y)) {
+        Ok(c) => out.push(format!(
+            "DXGI Desktop Duplication: OK on \"{}\" (D3D11 video support: {})",
+            c.adapter_name(),
+            if c.video_support() { "yes" } else { "NO" }
+        )),
+        Err(e) => out.push(format!("DXGI Desktop Duplication: FAILED ({e:#})")),
+    }
+
+    match mf::enumerate() {
+        Ok(list) if list.is_empty() => out.push("Hardware H.264 encoders: none".into()),
+        Ok(list) => {
+            out.push(format!("Hardware H.264 encoders: {}", list.len()));
+            for a in &list {
+                out.push(format!("  - {}", mf::friendly_name(a)));
+            }
+        }
+        Err(e) => out.push(format!("Hardware H.264 encoders: enumeration failed ({e:#})")),
+    }
+
+    match GpuPipeline::open(display, EncoderSettings::default(), EncoderChoice::Auto) {
+        Ok(p) => {
+            let i = p.info();
+            out.push(format!(
+                "GPU pipeline: OK — {}x{} -> {}x{}, encoder: {}{}",
+                i.source.0,
+                i.source.1,
+                i.encoded.0,
+                i.encoded.1,
+                i.encoder,
+                if i.hardware_encoder { " (hardware)" } else { " (software)" }
+            ));
+        }
+        Err(e) => out.push(format!("GPU pipeline: UNAVAILABLE ({e:#}) -> the agent will use the CPU pipeline")),
+    }
+    drop(runtime);
+    out
+}
