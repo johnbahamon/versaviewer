@@ -144,8 +144,14 @@ cargo run --release -p vv-engine --example headless_viewer -- \
 
 ## Limitaciones conocidas de la Fase 0
 
-- Solo el monitor principal. Captura por `xcap` (sin dirty-rects), H.264 por
-  software: ~15–25 fps a 1080p.
+- Solo el monitor principal. En Windows se captura con DXGI Desktop
+  Duplication (GDI como respaldo); las pantallas mayores de 1920×1200 se
+  reducen antes de codificar (`--max-width/--max-height`). H.264 por software.
+- La captura es **por cambios**: con la pantalla quieta no se envían frames,
+  así que los fps del título bajan a 0. Es lo esperado.
+- El cursor remoto no se dibuja en el vídeo; se ve el cursor del Mac.
+- Los logs `stream stats` (agente) y `receive stats` (viewer) muestran fps y
+  milisegundos por etapa (captura, conversión, codificación, decodificación).
 - No ve el escritorio seguro (UAC, pantalla de bloqueo) ni puede enviar
   Ctrl+Alt+Supr: requiere el agente como **servicio de Windows** (Fase 2).
 - ICE no-trickle: la conexión tarda 1–4 s en establecerse.

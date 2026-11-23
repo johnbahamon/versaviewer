@@ -47,8 +47,8 @@ flowchart TB
 | Crate | Responsabilidad | Fase 0 | Siguiente paso |
 |---|---|---|---|
 | `vv-protocol` | Mensajes JSON de señalización y de control (versión 1) | ✅ | Versionado/negociación de capacidades |
-| `vv-capture` | Captura de pantalla | `xcap` | DXGI Desktop Duplication + dirty rects (Windows) |
-| `vv-codec` | H.264 Annex-B | OpenH264 SW | Media Foundation/NVENC/QSV, VideoToolbox |
+| `vv-capture` | Captura de pantalla por cambios | DXGI Desktop Duplication (Windows), `xcap` (resto / respaldo) | Dirty rects, cursor, multi-monitor |
+| `vv-codec` | Conversión I420 multihilo con reducción por área + H.264 Annex-B | OpenH264 SW, máx. 1920×1200 | Media Foundation/NVENC/QSV, VideoToolbox |
 | `vv-input` | Inyección de input con teclas físicas (W3C `code`) | SendInput (Win), enigo (otros) | Multi-monitor, SAS vía servicio |
 | `vv-transport` | WebRTC (webrtc-rs 0.21), reensamblado RTP, cliente WS | ✅ | Trickle ICE, jitter buffer, BWE → bitrate |
 | `vv-engine` | Orquestación agente/viewer, OTP, rate limit, consentimiento | ✅ | Reconexión, FFI para Flutter |

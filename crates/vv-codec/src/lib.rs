@@ -12,14 +12,19 @@
 //! prefixed NAL units), which is what the RTP packetizer consumes and what the
 //! depacketizer produces.
 
+pub mod convert;
+
 use anyhow::{Context, Result};
+pub use convert::{PixelOrder, RawImage, fit_within};
+use convert::I420Buffer;
 use openh264::OpenH264API;
 use openh264::decoder::Decoder;
 use openh264::encoder::{
-    BitRate, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod, RateControlMode,
-    UsageType,
+    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, IntraFramePeriod,
+    RateControlMode, UsageType,
 };
-use openh264::formats::{RgbaSliceU8, YUVBuffer, YUVSource};
+use openh264::formats::YUVSource;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
 pub struct EncoderSettings {
@@ -27,11 +32,22 @@ pub struct EncoderSettings {
     pub max_fps: f32,
     /// Force an IDR every N frames so a viewer can always resync.
     pub keyframe_interval: u32,
+    /// Frames larger than this are downscaled (area average) before encoding.
+    /// Software H.264 cost grows with pixel count; 1920x1200 keeps text legible
+    /// while making 4K / high-DPI screens encodable in real time.
+    pub max_width: u32,
+    pub max_height: u32,
 }
 
 impl Default for EncoderSettings {
     fn default() -> Self {
-        Self { bitrate_bps: 6_000_000, max_fps: 30.0, keyframe_interval: 300 }
+        Self {
+            bitrate_bps: 6_000_000,
+            max_fps: 30.0,
+            keyframe_interval: 300,
+            max_width: 1920,
+            max_height: 1200,
+        }
     }
 }
 
@@ -41,28 +57,35 @@ pub struct EncodedFrame {
     pub keyframe: bool,
 }
 
-pub struct H264Encoder {
-    inner: Encoder,
-    yuv: YUVBuffer,
-    width: u32,
-    height: u32,
-    settings: EncoderSettings,
+/// Time spent in each stage of the last [`H264Encoder::encode`] call.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EncodeTimings {
+    pub convert: Duration,
+    pub encode: Duration,
 }
 
-/// H.264 4:2:0 requires even dimensions; we crop the last odd row/column.
-pub fn even_dimensions(width: u32, height: u32) -> (u32, u32) {
-    (width & !1, height & !1)
+pub struct H264Encoder {
+    inner: Encoder,
+    yuv: I420Buffer,
+    source: (u32, u32),
+    settings: EncoderSettings,
+    timings: EncodeTimings,
 }
 
 impl H264Encoder {
-    pub fn new(width: u32, height: u32, settings: EncoderSettings) -> Result<Self> {
-        let (width, height) = even_dimensions(width, height);
+    /// Creates an encoder for frames of `src_width` x `src_height`. The encoded
+    /// size is that, scaled down to fit `settings.max_*` and rounded to even.
+    pub fn new(src_width: u32, src_height: u32, settings: EncoderSettings) -> Result<Self> {
+        let (width, height) =
+            fit_within(src_width, src_height, settings.max_width, settings.max_height);
         let config = EncoderConfig::new()
             .usage_type(UsageType::ScreenContentRealTime)
             .rate_control_mode(RateControlMode::Bitrate)
             .bitrate(BitRate::from_bps(settings.bitrate_bps))
             .max_frame_rate(FrameRate::from_hz(settings.max_fps))
             .intra_frame_period(IntraFramePeriod::from_num_frames(settings.keyframe_interval))
+            .complexity(Complexity::Low)
+            .num_threads(0) // auto: one per core
             .adaptive_quantization(false)
             .background_detection(false)
             .skip_frames(true);
@@ -70,19 +93,29 @@ impl H264Encoder {
             .context("creating OpenH264 encoder")?;
         Ok(Self {
             inner,
-            yuv: YUVBuffer::new(width as usize, height as usize),
-            width,
-            height,
+            yuv: I420Buffer::new(width, height),
+            source: (src_width, src_height),
             settings,
+            timings: EncodeTimings::default(),
         })
     }
 
+    /// Encoded (output) size.
     pub fn dimensions(&self) -> (u32, u32) {
-        (self.width, self.height)
+        self.yuv.dimensions_u32()
+    }
+
+    /// Input frame size this encoder was created for.
+    pub fn source_dimensions(&self) -> (u32, u32) {
+        self.source
     }
 
     pub fn settings(&self) -> EncoderSettings {
         self.settings
+    }
+
+    pub fn last_timings(&self) -> EncodeTimings {
+        self.timings
     }
 
     /// Makes the next encoded frame an IDR (keyframe).
@@ -90,51 +123,34 @@ impl H264Encoder {
         self.inner.force_intra_frame();
     }
 
-    /// Encodes one RGBA frame. `src_width`/`src_height` may be one pixel larger
-    /// than the encoder dimensions (odd sizes); extra rows/columns are dropped.
-    /// Returns `None` when the encoder decided to skip the frame.
-    pub fn encode_rgba(
-        &mut self,
-        rgba: &[u8],
-        src_width: u32,
-        src_height: u32,
-    ) -> Result<Option<EncodedFrame>> {
+    /// Converts, downscales and encodes one frame. Returns `None` when the
+    /// encoder decided to skip it (rate control).
+    pub fn encode(&mut self, src: &RawImage<'_>) -> Result<Option<EncodedFrame>> {
         anyhow::ensure!(
-            even_dimensions(src_width, src_height) == (self.width, self.height),
-            "frame {src_width}x{src_height} does not match encoder {}x{}",
-            self.width,
-            self.height
+            (src.width, src.height) == self.source,
+            "frame {}x{} does not match encoder input {}x{}",
+            src.width,
+            src.height,
+            self.source.0,
+            self.source.1
         );
-        let cropped;
-        let pixels: &[u8] = if src_width == self.width && src_height == self.height {
-            rgba
-        } else {
-            cropped = crop_rgba(rgba, src_width, self.width, self.height);
-            &cropped
-        };
-        self.yuv
-            .read_rgba8(RgbaSliceU8::new(pixels, (self.width as usize, self.height as usize)));
+        let t0 = Instant::now();
+        self.yuv.fill_from(src);
+        let t1 = Instant::now();
         let bitstream = self.inner.encode(&self.yuv).context("encoding frame")?;
         let frame_type = bitstream.frame_type();
-        if matches!(frame_type, FrameType::Skip | FrameType::Invalid) {
-            return Ok(None);
-        }
         let data = bitstream.to_vec();
-        if data.is_empty() {
+        self.timings = EncodeTimings { convert: t1 - t0, encode: t1.elapsed() };
+        if matches!(frame_type, FrameType::Skip | FrameType::Invalid) || data.is_empty() {
             return Ok(None);
         }
         Ok(Some(EncodedFrame { data, keyframe: matches!(frame_type, FrameType::IDR | FrameType::I) }))
     }
-}
 
-fn crop_rgba(src: &[u8], src_width: u32, width: u32, height: u32) -> Vec<u8> {
-    let src_stride = src_width as usize * 4;
-    let row = width as usize * 4;
-    let mut out = Vec::with_capacity(row * height as usize);
-    for y in 0..height as usize {
-        out.extend_from_slice(&src[y * src_stride..y * src_stride + row]);
+    /// Convenience for tightly packed RGBA buffers.
+    pub fn encode_rgba(&mut self, rgba: &[u8], width: u32, height: u32) -> Result<Option<EncodedFrame>> {
+        self.encode(&RawImage { data: rgba, width, height, stride: width as usize * 4, order: PixelOrder::Rgba })
     }
-    out
 }
 
 /// Decoded frame as packed `0x00RRGGBB` pixels (the format `softbuffer` wants).

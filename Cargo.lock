@@ -4022,6 +4022,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "tracing",
+ "windows 0.62.2",
  "xcap",
 ]
 

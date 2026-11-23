@@ -33,6 +33,11 @@ struct Cli {
     /// Video bitrate in kbit/s.
     #[arg(long, default_value_t = 6000)]
     bitrate: u32,
+    /// Larger screens are downscaled to fit this size before encoding.
+    #[arg(long, default_value_t = 1920)]
+    max_width: u32,
+    #[arg(long, default_value_t = 1200)]
+    max_height: u32,
     #[arg(long, env = "VV_STUN")]
     stun: Option<String>,
     /// TURN server, e.g. turn:192.168.1.20:3478
@@ -151,6 +156,7 @@ fn print_event(event: AgentEvent, unattended: bool) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    vv_engine::agent::platform_init();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -189,6 +195,8 @@ async fn main() -> Result<()> {
         encoder: EncoderSettings {
             bitrate_bps: cli.bitrate * 1000,
             max_fps: cli.fps,
+            max_width: cli.max_width,
+            max_height: cli.max_height,
             ..Default::default()
         },
         display: cli.display,

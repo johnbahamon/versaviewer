@@ -198,11 +198,30 @@ fn spawn_decoder(sink: Sink) -> std::sync::mpsc::Sender<Bytes> {
                     return;
                 }
             };
+            let (mut since, mut frames, mut bytes, mut busy) =
+                (Instant::now(), 0u32, 0usize, Duration::ZERO);
             for au in rx {
-                match decoder.decode(&au) {
-                    Ok(Some(frame)) => sink(ViewerEvent::Frame(frame)),
+                let t = Instant::now();
+                let result = decoder.decode(&au);
+                busy += t.elapsed();
+                bytes += au.len();
+                match result {
+                    Ok(Some(frame)) => {
+                        frames += 1;
+                        sink(ViewerEvent::Frame(frame));
+                    }
                     Ok(None) => {}
                     Err(e) => tracing::debug!("decode error: {e:#}"),
+                }
+                let secs = since.elapsed().as_secs_f32();
+                if secs >= 5.0 {
+                    tracing::info!(
+                        fps = format!("{:.1}", frames as f32 / secs),
+                        kbps = format!("{:.0}", bytes as f32 * 8.0 / 1000.0 / secs),
+                        decode_ms = format!("{:.1}", busy.as_secs_f32() * 1000.0 / frames.max(1) as f32),
+                        "receive stats"
+                    );
+                    (since, frames, bytes, busy) = (Instant::now(), 0, 0, Duration::ZERO);
                 }
             }
         })

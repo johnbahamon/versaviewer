@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
-use vv_capture::ScreenCapturer;
 use vv_codec::{EncodedFrame, EncoderSettings, H264Encoder};
 use vv_protocol::PROTOCOL_VERSION;
 use vv_protocol::control::ControlMessage;
@@ -321,6 +320,10 @@ async fn run_session(
 
 /// Capture + encode loop on a dedicated thread (capture handles are
 /// thread-affine on Windows, and encoding is CPU-bound).
+///
+/// Change-driven: with DXGI nothing is encoded while the screen is static.
+/// The last frame is kept to answer keyframe requests and to re-send the
+/// final state if rate control skipped it.
 fn spawn_capture(
     display: Option<usize>,
     settings: EncoderSettings,
@@ -333,12 +336,18 @@ fn spawn_capture(
         .name("vv-capture".into())
         .spawn(move || {
             let init = (|| -> Result<_> {
-                let capturer = vv_capture::XcapCapturer::open(display)?;
-                let (w, h) = capturer.dimensions();
-                let encoder = H264Encoder::new(w, h, settings)?;
-                Ok((capturer, encoder))
+                let mut capturer = vv_capture::open_capturer(display)?;
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let first = loop {
+                    if let Some(f) = capturer.next_frame(Duration::from_millis(100))? {
+                        break f;
+                    }
+                    anyhow::ensure!(Instant::now() < deadline, "no initial frame from capturer");
+                };
+                let encoder = H264Encoder::new(first.width, first.height, settings)?;
+                Ok((capturer, encoder, first))
             })();
-            let (mut capturer, mut encoder) = match init {
+            let (mut capturer, mut encoder, mut last) = match init {
                 Ok(v) => {
                     let _ = dims.send(Ok(v.1.dimensions()));
                     v
@@ -348,63 +357,147 @@ fn spawn_capture(
                     return;
                 }
             };
+            tracing::info!(
+                backend = capturer.backend(),
+                source = format!("{}x{}", last.width, last.height),
+                encoded = format!("{}x{}", encoder.dimensions().0, encoder.dimensions().1),
+                "video pipeline ready"
+            );
+
             let interval = Duration::from_secs_f32(1.0 / settings.max_fps.max(1.0));
-            let mut last = Instant::now();
-            let mut stats = (Instant::now(), 0u32, 0usize);
+            let mut last_encode = Instant::now() - interval;
+            let mut fresh = true; // the initial frame has not been encoded yet
+            let mut needs_refresh = false; // last encode was skipped by rate control
+            let mut stats = Stats::new();
             while !stop.load(Ordering::Relaxed) {
-                let started = Instant::now();
-                let frame = match capturer.capture() {
-                    Ok(f) => f,
+                // Pace on frame *start* times: the budget for one frame includes
+                // capture + encode, so only sleep for what is left of it.
+                if let Some(rest) = interval.checked_sub(last_encode.elapsed()) {
+                    std::thread::sleep(rest);
+                }
+                let want_keyframe = keyframe.swap(false, Ordering::Relaxed);
+                let t_capture = Instant::now();
+                match capturer.next_frame(Duration::from_millis(100)) {
+                    Ok(Some(f)) => {
+                        stats.capture += t_capture.elapsed();
+                        last = f;
+                    }
+                    Ok(None) => {
+                        // Screen unchanged: only re-encode if someone needs it.
+                        if !(want_keyframe || needs_refresh || fresh) {
+                            continue;
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!("capture failed: {e:#}");
+                        if want_keyframe {
+                            keyframe.store(true, Ordering::Relaxed); // don't lose the request
+                        }
                         std::thread::sleep(Duration::from_millis(200));
                         continue;
                     }
-                };
-                if vv_codec::even_dimensions(frame.width, frame.height) != encoder.dimensions() {
-                    match H264Encoder::new(frame.width, frame.height, settings) {
-                        Ok(e) => encoder = e,
+                }
+
+                if encoder.source_dimensions() != (last.width, last.height) {
+                    match H264Encoder::new(last.width, last.height, settings) {
+                        Ok(e) => {
+                            tracing::info!(
+                                source = format!("{}x{}", last.width, last.height),
+                                "display resolution changed; encoder recreated"
+                            );
+                            encoder = e;
+                        }
                         Err(e) => {
                             tracing::error!("recreating encoder: {e:#}");
                             break;
                         }
                     }
                 }
-                if keyframe.swap(false, Ordering::Relaxed) {
+                if want_keyframe {
                     encoder.request_keyframe();
                 }
-                match encoder.encode_rgba(&frame.rgba, frame.width, frame.height) {
+                let image = vv_codec::RawImage {
+                    data: &last.data,
+                    width: last.width,
+                    height: last.height,
+                    stride: last.stride,
+                    order: match last.format {
+                        vv_capture::PixelFormat::Rgba8 => vv_codec::PixelOrder::Rgba,
+                        vv_capture::PixelFormat::Bgra8 => vv_codec::PixelOrder::Bgra,
+                    },
+                };
+                let encoded = encoder.encode(&image);
+                let duration = t_capture - last_encode;
+                last_encode = t_capture;
+                fresh = false;
+                let t = encoder.last_timings();
+                stats.convert += t.convert;
+                stats.encode += t.encode;
+                match encoded {
                     Ok(Some(encoded)) => {
-                        let now = Instant::now();
-                        let duration = now - last;
-                        last = now;
-                        stats.1 += 1;
-                        stats.2 += encoded.data.len();
+                        needs_refresh = false;
+                        stats.frames += 1;
+                        stats.bytes += encoded.data.len();
                         // Blocking send = backpressure. Dropping encoded frames
                         // would break the H.264 reference chain.
                         if frames.blocking_send((encoded, duration)).is_err() {
                             break;
                         }
                     }
-                    Ok(None) => {}
+                    Ok(None) => needs_refresh = true,
                     Err(e) => tracing::warn!("encode failed: {e:#}"),
                 }
-                if stats.0.elapsed() >= Duration::from_secs(5) {
-                    let secs = stats.0.elapsed().as_secs_f32();
-                    tracing::info!(
-                        fps = format!("{:.1}", stats.1 as f32 / secs),
-                        kbps = format!("{:.0}", stats.2 as f32 * 8.0 / 1000.0 / secs),
-                        "stream stats"
-                    );
-                    stats = (Instant::now(), 0, 0);
-                }
-                if let Some(rest) = interval.checked_sub(started.elapsed()) {
-                    std::thread::sleep(rest);
-                }
+                stats.maybe_log(capturer.backend(), &encoder);
             }
             tracing::info!("capture thread stopped");
         })
         .expect("spawning capture thread")
+}
+
+/// Per-stage timing, logged every few seconds to find bottlenecks.
+struct Stats {
+    since: Instant,
+    frames: u32,
+    bytes: usize,
+    capture: Duration,
+    convert: Duration,
+    encode: Duration,
+}
+
+impl Stats {
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            frames: 0,
+            bytes: 0,
+            capture: Duration::ZERO,
+            convert: Duration::ZERO,
+            encode: Duration::ZERO,
+        }
+    }
+
+    fn maybe_log(&mut self, backend: &str, encoder: &H264Encoder) {
+        let secs = self.since.elapsed().as_secs_f32();
+        if secs < 5.0 {
+            return;
+        }
+        let per = |d: Duration| {
+            if self.frames == 0 { 0.0 } else { d.as_secs_f32() * 1000.0 / self.frames as f32 }
+        };
+        let (sw, sh) = encoder.source_dimensions();
+        let (ew, eh) = encoder.dimensions();
+        tracing::info!(
+            fps = format!("{:.1}", self.frames as f32 / secs),
+            kbps = format!("{:.0}", self.bytes as f32 * 8.0 / 1000.0 / secs),
+            capture_ms = format!("{:.1}", per(self.capture)),
+            convert_ms = format!("{:.1}", per(self.convert)),
+            encode_ms = format!("{:.1}", per(self.encode)),
+            res = format!("{sw}x{sh}->{ew}x{eh}"),
+            backend,
+            "stream stats"
+        );
+        *self = Self::new();
+    }
 }
 
 /// Input injection on a dedicated thread (injectors are thread-affine).
@@ -444,6 +537,11 @@ fn spawn_input(
             let _ = injector.release_all();
         })?;
     Ok((tx, handle))
+}
+
+/// Process-wide platform setup (DPI awareness on Windows). Call first thing in `main`.
+pub fn platform_init() {
+    vv_capture::platform_init();
 }
 
 /// Displays available for sharing.
