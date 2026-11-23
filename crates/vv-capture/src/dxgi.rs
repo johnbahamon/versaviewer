@@ -42,6 +42,8 @@ pub struct DxgiCapturer {
     /// even if DXGI reports "no new present").
     need_initial: bool,
     retry_at: Option<Instant>,
+    /// Recycled frame buffers (see [`ScreenCapturer::recycle`]).
+    spare: Vec<Vec<u8>>,
 }
 
 impl DxgiCapturer {
@@ -99,6 +101,7 @@ impl DxgiCapturer {
                         height: (r.bottom - r.top) as u32,
                         need_initial: true,
                         retry_at: None,
+                        spare: Vec::new(),
                     };
                     capturer.duplicate().context("DuplicateOutput")?;
                     return Ok(capturer);
@@ -164,7 +167,9 @@ impl DxgiCapturer {
                 .context("Map(staging)")?;
             let stride = mapped.RowPitch as usize;
             let len = stride * height as usize;
-            let data = std::slice::from_raw_parts(mapped.pData as *const u8, len).to_vec();
+            let mut data = self.spare.pop().unwrap_or_default();
+            data.clear();
+            data.extend_from_slice(std::slice::from_raw_parts(mapped.pData as *const u8, len));
             self.context.Unmap(&staging, 0);
             Ok(Frame { width, height, stride, format: PixelFormat::Bgra8, data })
         }
@@ -184,6 +189,12 @@ impl ScreenCapturer for DxgiCapturer {
 
     fn backend(&self) -> &'static str {
         "dxgi"
+    }
+
+    fn recycle(&mut self, buffer: Vec<u8>) {
+        if self.spare.len() < 3 {
+            self.spare.push(buffer);
+        }
     }
 
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>> {

@@ -16,7 +16,8 @@
 use crate::credentials::{self, AttemptLimiter};
 use anyhow::{Context, Result, anyhow};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use vv_codec::{EncodedFrame, EncoderSettings, H264Encoder};
@@ -252,6 +253,9 @@ async fn run_session(
 
     let stop_capture = Arc::new(AtomicBool::new(false));
     let keyframe = Arc::new(AtomicBool::new(true));
+    // Video is only encoded/sent once DTLS-SRTP is up; before that every RTP
+    // packet would be dropped by the stack (and logged).
+    let connected = Arc::new(AtomicBool::new(false));
     let (frames_tx, mut frames_rx) = mpsc::channel::<(EncodedFrame, Duration)>(2);
     let (dims_tx, dims_rx) = tokio::sync::oneshot::channel();
     let capture = spawn_capture(
@@ -259,6 +263,7 @@ async fn run_session(
         config.encoder,
         frames_tx,
         keyframe.clone(),
+        connected.clone(),
         stop_capture.clone(),
         dims_tx,
     );
@@ -273,6 +278,9 @@ async fn run_session(
                 let Some((frame, duration)) = frame else {
                     break "screen capture stopped".to_string();
                 };
+                if !connected.load(Ordering::Relaxed) {
+                    continue; // encoded before the handshake finished; IDR follows on connect
+                }
                 if let Err(e) = peer.send_video_frame(frame.data, duration).await {
                     tracing::debug!("video send failed: {e}");
                 }
@@ -283,6 +291,7 @@ async fn run_session(
                     PeerEvent::State(ConnectionState::Connected) => {
                         tracing::info!("session {session_id}: peer connected");
                         keyframe.store(true, Ordering::Relaxed);
+                        connected.store(true, Ordering::Relaxed);
                     }
                     PeerEvent::State(s @ (ConnectionState::Failed | ConnectionState::Closed)) => {
                         break format!("connection {s}");
@@ -318,84 +327,126 @@ async fn run_session(
     Ok(reason)
 }
 
-/// Capture + encode loop on a dedicated thread (capture handles are
-/// thread-affine on Windows, and encoding is CPU-bound).
+/// Latest-frame mailbox between the capture and encode threads. Holding at
+/// most one frame means the encoder always works on the freshest screen
+/// state; a frame it had no time for is simply replaced (raw frames can be
+/// dropped freely — only *encoded* frames form a reference chain).
+struct Mailbox {
+    slot: Mutex<Option<vv_capture::Frame>>,
+    ready: Condvar,
+}
+
+impl Mailbox {
+    fn put(&self, frame: vv_capture::Frame) -> Option<vv_capture::Frame> {
+        let old = self.slot.lock().expect("mailbox poisoned").replace(frame);
+        self.ready.notify_one();
+        old
+    }
+
+    fn take(&self, timeout: Duration) -> Option<vv_capture::Frame> {
+        let guard = self.slot.lock().expect("mailbox poisoned");
+        let (mut guard, _) = self
+            .ready
+            .wait_timeout_while(guard, timeout, |s| s.is_none())
+            .expect("mailbox poisoned");
+        guard.take()
+    }
+}
+
+/// Capture-side counters read by the encoder thread's stats.
+#[derive(Default)]
+struct CaptureCounters {
+    busy_us: AtomicU64,
+    frames: AtomicU64,
+}
+
+/// Starts the video pipeline: a capture thread and an encode thread running
+/// in parallel, so frame N+1 is captured while frame N is being encoded.
 ///
 /// Change-driven: with DXGI nothing is encoded while the screen is static.
-/// The last frame is kept to answer keyframe requests and to re-send the
-/// final state if rate control skipped it.
+/// The encoder keeps the last frame to answer keyframe requests and to
+/// re-send the final state if rate control skipped it.
 fn spawn_capture(
     display: Option<usize>,
     settings: EncoderSettings,
     frames: mpsc::Sender<(EncodedFrame, Duration)>,
     keyframe: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     dims: tokio::sync::oneshot::Sender<Result<(u32, u32)>>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
-        .name("vv-capture".into())
+        .name("vv-encode".into())
         .spawn(move || {
+            let interval = Duration::from_secs_f32(1.0 / settings.max_fps.max(1.0));
+            let mailbox = Arc::new(Mailbox { slot: Mutex::new(None), ready: Condvar::new() });
+            let counters = Arc::new(CaptureCounters::default());
+            let (recycle_tx, recycle_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+            let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<&'static str>>();
+
+            let capture_thread = {
+                let (mailbox, counters, stop) = (mailbox.clone(), counters.clone(), stop.clone());
+                std::thread::Builder::new()
+                    .name("vv-capture".into())
+                    .spawn(move || {
+                        capture_loop(display, interval, &mailbox, &counters, &recycle_rx, &stop, init_tx)
+                    })
+                    .expect("spawning capture thread")
+            };
+
             let init = (|| -> Result<_> {
-                let mut capturer = vv_capture::open_capturer(display)?;
-                let deadline = Instant::now() + Duration::from_secs(3);
-                let first = loop {
-                    if let Some(f) = capturer.next_frame(Duration::from_millis(100))? {
-                        break f;
-                    }
-                    anyhow::ensure!(Instant::now() < deadline, "no initial frame from capturer");
-                };
+                let backend = init_rx.recv().map_err(|_| anyhow!("capture thread died"))??;
+                let first = mailbox
+                    .take(Duration::from_secs(3))
+                    .ok_or_else(|| anyhow!("no initial frame from capturer"))?;
                 let encoder = H264Encoder::new(first.width, first.height, settings)?;
-                Ok((capturer, encoder, first))
+                Ok((backend, encoder, first))
             })();
-            let (mut capturer, mut encoder, mut last) = match init {
+            let (backend, mut encoder, mut last) = match init {
                 Ok(v) => {
                     let _ = dims.send(Ok(v.1.dimensions()));
                     v
                 }
                 Err(e) => {
                     let _ = dims.send(Err(e));
+                    stop.store(true, Ordering::Relaxed);
+                    let _ = capture_thread.join();
                     return;
                 }
             };
             tracing::info!(
-                backend = capturer.backend(),
+                backend,
                 source = format!("{}x{}", last.width, last.height),
                 encoded = format!("{}x{}", encoder.dimensions().0, encoder.dimensions().1),
                 "video pipeline ready"
             );
 
-            let interval = Duration::from_secs_f32(1.0 / settings.max_fps.max(1.0));
             let mut last_encode = Instant::now() - interval;
-            let mut fresh = true; // the initial frame has not been encoded yet
+            let mut fresh = true; // `last` has not been sent yet
             let mut needs_refresh = false; // last encode was skipped by rate control
             let mut stats = Stats::new();
             while !stop.load(Ordering::Relaxed) {
-                // Pace on frame *start* times: the budget for one frame includes
-                // capture + encode, so only sleep for what is left of it.
                 if let Some(rest) = interval.checked_sub(last_encode.elapsed()) {
                     std::thread::sleep(rest);
                 }
                 let want_keyframe = keyframe.swap(false, Ordering::Relaxed);
-                let t_capture = Instant::now();
-                match capturer.next_frame(Duration::from_millis(100)) {
-                    Ok(Some(f)) => {
-                        stats.capture += t_capture.elapsed();
-                        last = f;
+                match mailbox.take(Duration::from_millis(100)) {
+                    Some(f) => {
+                        let old = std::mem::replace(&mut last, f);
+                        let _ = recycle_tx.send(old.data);
+                        fresh = true;
                     }
-                    Ok(None) => {
-                        // Screen unchanged: only re-encode if someone needs it.
-                        if !(want_keyframe || needs_refresh || fresh) {
-                            continue;
-                        }
+                    None if !(want_keyframe || needs_refresh || fresh) => continue,
+                    None => {}
+                }
+                if !connected.load(Ordering::Relaxed) {
+                    // Nothing can be sent yet: keep the newest frame and the
+                    // keyframe request for when the connection is up.
+                    if want_keyframe {
+                        keyframe.store(true, Ordering::Relaxed);
                     }
-                    Err(e) => {
-                        tracing::warn!("capture failed: {e:#}");
-                        if want_keyframe {
-                            keyframe.store(true, Ordering::Relaxed); // don't lose the request
-                        }
-                        std::thread::sleep(Duration::from_millis(200));
-                        continue;
-                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
                 }
 
                 if encoder.source_dimensions() != (last.width, last.height) {
@@ -426,9 +477,10 @@ fn spawn_capture(
                         vv_capture::PixelFormat::Bgra8 => vv_codec::PixelOrder::Bgra,
                     },
                 };
+                let started = Instant::now();
                 let encoded = encoder.encode(&image);
-                let duration = t_capture - last_encode;
-                last_encode = t_capture;
+                let duration = started - last_encode;
+                last_encode = started;
                 fresh = false;
                 let t = encoder.last_timings();
                 stats.convert += t.convert;
@@ -447,11 +499,61 @@ fn spawn_capture(
                     Ok(None) => needs_refresh = true,
                     Err(e) => tracing::warn!("encode failed: {e:#}"),
                 }
-                stats.maybe_log(capturer.backend(), &encoder);
+                stats.maybe_log(backend, &encoder, &counters);
             }
-            tracing::info!("capture thread stopped");
+            stop.store(true, Ordering::Relaxed);
+            let _ = capture_thread.join();
+            tracing::info!("video pipeline stopped");
         })
-        .expect("spawning capture thread")
+        .expect("spawning encode thread")
+}
+
+fn capture_loop(
+    display: Option<usize>,
+    interval: Duration,
+    mailbox: &Mailbox,
+    counters: &CaptureCounters,
+    recycle: &std::sync::mpsc::Receiver<Vec<u8>>,
+    stop: &AtomicBool,
+    init: std::sync::mpsc::Sender<Result<&'static str>>,
+) {
+    let mut capturer = match vv_capture::open_capturer(display) {
+        Ok(c) => {
+            let _ = init.send(Ok(c.backend()));
+            c
+        }
+        Err(e) => {
+            let _ = init.send(Err(e));
+            return;
+        }
+    };
+    let mut last_capture = Instant::now() - interval;
+    while !stop.load(Ordering::Relaxed) {
+        // Same pacing as the encoder: polling backends would otherwise spin,
+        // and DXGI simply accumulates changes while we wait.
+        if let Some(rest) = interval.checked_sub(last_capture.elapsed()) {
+            std::thread::sleep(rest);
+        }
+        while let Ok(buffer) = recycle.try_recv() {
+            capturer.recycle(buffer);
+        }
+        let started = Instant::now();
+        match capturer.next_frame(Duration::from_millis(100)) {
+            Ok(Some(frame)) => {
+                last_capture = started;
+                counters.busy_us.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                counters.frames.fetch_add(1, Ordering::Relaxed);
+                if let Some(dropped) = mailbox.put(frame) {
+                    capturer.recycle(dropped.data);
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("capture failed: {e:#}");
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    }
 }
 
 /// Per-stage timing, logged every few seconds to find bottlenecks.
@@ -459,7 +561,6 @@ struct Stats {
     since: Instant,
     frames: u32,
     bytes: usize,
-    capture: Duration,
     convert: Duration,
     encode: Duration,
 }
@@ -470,13 +571,12 @@ impl Stats {
             since: Instant::now(),
             frames: 0,
             bytes: 0,
-            capture: Duration::ZERO,
             convert: Duration::ZERO,
             encode: Duration::ZERO,
         }
     }
 
-    fn maybe_log(&mut self, backend: &str, encoder: &H264Encoder) {
+    fn maybe_log(&mut self, backend: &str, encoder: &H264Encoder, capture: &CaptureCounters) {
         let secs = self.since.elapsed().as_secs_f32();
         if secs < 5.0 {
             return;
@@ -486,10 +586,13 @@ impl Stats {
         };
         let (sw, sh) = encoder.source_dimensions();
         let (ew, eh) = encoder.dimensions();
+        let cap_frames = capture.frames.swap(0, Ordering::Relaxed);
+        let cap_us = capture.busy_us.swap(0, Ordering::Relaxed);
         tracing::info!(
             fps = format!("{:.1}", self.frames as f32 / secs),
             kbps = format!("{:.0}", self.bytes as f32 * 8.0 / 1000.0 / secs),
-            capture_ms = format!("{:.1}", per(self.capture)),
+            captured_fps = format!("{:.1}", cap_frames as f32 / secs),
+            capture_ms = format!("{:.1}", cap_us as f32 / 1000.0 / cap_frames.max(1) as f32),
             convert_ms = format!("{:.1}", per(self.convert)),
             encode_ms = format!("{:.1}", per(self.encode)),
             res = format!("{sw}x{sh}->{ew}x{eh}"),

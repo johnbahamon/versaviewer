@@ -42,6 +42,9 @@ pub trait ScreenCapturer {
     /// Waits up to `timeout` for a new frame. `Ok(None)` means the screen did
     /// not change (change-driven backends) — the caller keeps its last frame.
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>>;
+    /// Hands back a consumed frame's buffer for reuse. Reusing multi-megabyte
+    /// buffers avoids an allocation + page faults per frame (a 4K frame is 33 MB).
+    fn recycle(&mut self, _buffer: Vec<u8>) {}
 }
 
 /// Process-wide setup that must run before any capture or window API.
